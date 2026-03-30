@@ -27,6 +27,10 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that c
 - **Market Data**: Get quotes and options chains
 - **Backtesting**: Test strategies on historical data
 
+## Hosted deployment
+
+A hosted deployment is available on [Fronteir AI](https://fronteir.ai/mcp/etbars-vibetrader-mcp).
+
 ## Available Tools
 
 | Tool | Description |

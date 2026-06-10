@@ -14,6 +14,7 @@ from datetime import datetime
 import httpx
 from dotenv import load_dotenv
 from fastmcp import FastMCP
+from fastmcp.server.dependencies import get_http_headers
 
 load_dotenv()
 
@@ -64,15 +65,61 @@ class VibeTraderClient:
         return await self._request("DELETE", endpoint)
 
 
-# Token cache
-_authenticated_token: Optional[str] = None
+# =============================================================================
+# Per-request auth (multi-tenant safe)
+# =============================================================================
+# This server is deployed over HTTP (uvicorn) as a SHARED single process: one
+# Python process handles every connected user. A module-global "current token"
+# is therefore last-writer-wins across users — whoever authenticated most
+# recently silently owns every other session's tool calls, exposing and
+# mutating strangers' real-money accounts.
+#
+# Tokens are now resolved PER REQUEST, in priority order:
+#   1. The request's own `Authorization: Bearer vt_...` header (stateless
+#      clients that send the key on every call — the most secure path).
+#   2. A token stored against THIS MCP session id by the `authenticate` tool
+#      (preserves the "authenticate once" UX; isolated per session).
+#   3. A single-process fallback for local stdio use (no HTTP context, one
+#      user) — never reachable when running under HTTP.
+#
+# get_http_headers() is request-scoped via contextvars, so each concurrent
+# task sees only its own request — that is what fixes the cross-user bleed.
+
+# session_id -> validated vt_ key. Only used under HTTP (multi-user).
+_tokens_by_session: dict[str, str] = {}
+# Local stdio single-user fallback (no HTTP request context exists).
+_stdio_token: Optional[str] = None
+
+
+def _http_headers() -> dict:
+    """Current request's headers (lowercased), or {} when not under HTTP."""
+    try:
+        return get_http_headers() or {}
+    except Exception:
+        return {}
+
+
+def _is_http_context() -> bool:
+    return bool(_http_headers())
+
+
+def _session_id() -> Optional[str]:
+    return _http_headers().get("mcp-session-id")
+
+
+def _request_bearer() -> Optional[str]:
+    auth = _http_headers().get("authorization", "")
+    if auth.lower().startswith("bearer "):
+        token = auth[7:].strip()
+        return token or None
+    return None
 
 
 async def validate_token(api_key: str) -> tuple[bool, str]:
-    global _authenticated_token
+    """Validate a key against the API. Pure check — stores nothing global."""
     if not api_key.startswith("vt_"):
         return False, "Invalid format. Keys start with 'vt_'"
-    
+
     async with httpx.AsyncClient() as client:
         try:
             response = await client.post(
@@ -81,17 +128,35 @@ async def validate_token(api_key: str) -> tuple[bool, str]:
                 timeout=30.0
             )
             if response.status_code == 200:
-                _authenticated_token = api_key
                 return True, response.json().get("email", "user")
             return False, "Invalid API key"
         except Exception as e:
             return False, str(e)
 
 
+def _resolve_token() -> Optional[str]:
+    # 1. Explicit per-request Authorization header.
+    token = _request_bearer()
+    if token:
+        return token
+    # 2. Per-session token set via the authenticate tool (HTTP, multi-user).
+    sid = _session_id()
+    if sid and sid in _tokens_by_session:
+        return _tokens_by_session[sid]
+    # 3. Local stdio single-user fallback (no HTTP context).
+    if not _is_http_context():
+        return _stdio_token
+    return None
+
+
 def get_client() -> VibeTraderClient:
-    if not _authenticated_token:
-        raise Exception("Not authenticated! Use 'authenticate' tool first.")
-    return VibeTraderClient(_authenticated_token)
+    token = _resolve_token()
+    if not token:
+        raise Exception(
+            "Not authenticated! Use the 'authenticate' tool with your API key, "
+            "or send it as an 'Authorization: Bearer vt_...' header."
+        )
+    return VibeTraderClient(token)
 
 
 # =============================================================================
@@ -102,9 +167,27 @@ def get_client() -> VibeTraderClient:
 async def authenticate(api_key: str) -> str:
     """Authenticate with your API key from vibetrader.markets/settings"""
     success, result = await validate_token(api_key)
-    if success:
+    if not success:
+        return f"❌ Authentication failed: {result}"
+
+    # Store the validated key scoped to THIS caller only — never a shared
+    # global (see the per-request auth section above for why).
+    sid = _session_id()
+    if sid:
+        _tokens_by_session[sid] = api_key
         return f"✅ Authenticated as {result}. You can now use all tools!"
-    return f"❌ Authentication failed: {result}"
+    if not _is_http_context():
+        # Local stdio: single user, safe to hold in-process.
+        global _stdio_token
+        _stdio_token = api_key
+        return f"✅ Authenticated as {result}. You can now use all tools!"
+    # HTTP request with no session id (unusual): can't isolate safely, so
+    # don't store a shared token. Direct the client to header auth instead.
+    return (
+        f"✅ Key valid for {result}, but this client didn't supply an MCP "
+        f"session. Configure your MCP client to send "
+        f"'Authorization: Bearer {api_key[:6]}...' on each request."
+    )
 
 
 @mcp.tool()

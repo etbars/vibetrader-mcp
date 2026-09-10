@@ -29,22 +29,40 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that c
 
 ## Available Tools
 
+All 30 are available over either endpoint below.
+
 | Tool | Description |
 |------|-------------|
-| `authenticate` | Connect with your VibeTrader API token |
-| `create_bot` | Create a trading bot from natural language |
-| `list_bots` | List all your bots |
-| `get_bot` | Get detailed bot info |
+| `authenticate` | Authenticate with your API key from vibetrader.markets/settings |
+| `create_bot` | Create a new trading bot using natural language |
+| `list_bots` | List all your trading bots |
+| `search_bots` | Search for bots by name |
+| `get_bot` | Get details of a specific bot |
+| `update_bot` | Update a bot's name or status |
+| `refine_bot` | Refine a bot's strategy using natural language |
 | `start_bot` | Start a paused bot |
 | `pause_bot` | Pause a running bot |
 | `delete_bot` | Delete a bot |
-| `set_trading_mode` | Switch between paper/live trading |
-| `get_portfolio` | View your positions |
-| `get_trade_history` | See recent trades |
-| `get_quote` | Get stock/ETF quotes |
-| `get_options_chain` | Get options data |
-| `backtest_strategy` | Backtest a strategy |
-| `list_strategy_templates` | See available templates |
+| `start_all_bots` | Start all paused bots at once |
+| `pause_all_bots` | Pause all running bots at once |
+| `delete_all_bots` | Delete ALL bots (requires `confirm='DELETE ALL'`) |
+| `get_bot_strategy` | Get the full strategy configuration for a bot |
+| `explain_bot_strategy` | Get a plain English explanation of a bot's strategy |
+| `get_bot_stats` | Get aggregate statistics across your bots |
+| `get_daily_trade_stats` | Get daily trading statistics for a bot |
+| `get_portfolio` | Get portfolio positions and balance |
+| `get_positions` | Get current open positions with unrealized P&L |
+| `get_account_summary` | Get account balance, buying power, and key metrics |
+| `close_position` | Close a position by symbol |
+| `place_order` | Place a buy or sell order |
+| `get_trade_history` | Get recent trade history across all bots |
+| `get_bot_trades` | Get trade history for a specific bot |
+| `get_quote` | Get current quote for a stock |
+| `get_market_status` | Check if US stock markets are currently open |
+| `run_backtest` | Run a historical backtest for a bot's current strategy |
+| `list_backtests` | List all backtests for a bot |
+| `get_backtest` | Get detailed results for a specific backtest |
+| `quick_covered_call_backtest` | Run a quick covered call income strategy backtest |
 
 ## Endpoints
 

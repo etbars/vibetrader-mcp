@@ -48,15 +48,17 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that c
 
 ## Endpoints
 
-The hosted server speaks both MCP HTTP transports from the same URL:
+The hosted server speaks both MCP HTTP transports:
 
-| Transport | URL | Use it when |
-|-----------|-----|-------------|
-| Streamable HTTP (recommended) | `https://vibetrader-mcp-289016366682.us-central1.run.app/mcp` | Your client supports the current MCP HTTP transport. This is what the in-app setup at [vibetrader.markets/settings](https://vibetrader.markets/settings) gives you. |
-| SSE (legacy) | `https://vibetrader-mcp-289016366682.us-central1.run.app/sse` | Your client only speaks the older SSE transport. Its companion POST route is `/messages/`, which the server advertises to you automatically — you never configure it by hand. |
+| URL | Speaks |
+|-----|--------|
+| `https://vibetrader-mcp-289016366682.us-central1.run.app/mcp` | Streamable HTTP — the current MCP transport. **Use this one.** It is also what the in-app setup at [vibetrader.markets/settings](https://vibetrader.markets/settings) gives you. |
+| `https://vibetrader-mcp-289016366682.us-central1.run.app/sse` | Either transport. A client that opens an SSE stream gets one (with its companion `/messages/` POST route, which the stream advertises — you never configure it by hand); a client that POSTs JSON-RPC gets streamable HTTP, the same session space as `/mcp`. |
 
-Both transports expose the same tools and the same authentication. Prefer
-`/mcp`: SSE is deprecated upstream and is kept here for existing setups.
+Both URLs expose the same 30 tools and the same authentication, so an existing
+`/sse` setup keeps working as-is. Prefer `/mcp` for anything new: SSE is
+deprecated upstream, and `/sse` is kept working for setups copied from older
+versions of this README.
 
 ## Setup for Claude Desktop
 
@@ -88,7 +90,8 @@ Both transports expose the same tools and the same authentication. Prefer
 }
 ```
 
-   To use the legacy SSE transport instead, swap `/mcp` for `/sse`.
+   `/sse` works too — see [Endpoints](#endpoints) — but `/mcp` is the one to
+   use for a new setup.
 
 3. Restart Claude Desktop
 

@@ -19,6 +19,8 @@ from fastmcp.server.dependencies import get_http_headers
 from fastmcp.server.http import RequestContextMiddleware
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
+from starlette.routing import Route
+from starlette.types import Receive, Scope, Send
 
 load_dotenv()
 
@@ -1023,9 +1025,10 @@ async def quick_covered_call_backtest(
 #
 #   /mcp        streamable HTTP — the modern transport. Unchanged: same path,
 #               same session semantics as before this file grew a second one.
-#   /sse        SSE — the legacy transport the README (and therefore every
-#               setup copied from GitHub) has always advertised. It comes with
-#               a companion POST route at /messages/.
+#   /sse        the URL the README (and therefore every setup copied from
+#               GitHub) has always advertised, which used to 404. It now
+#               answers on either transport — see _SseEndpoint — and the SSE
+#               half brings its companion POST route at /messages/.
 #
 # Both sub-apps are built by FastMCP with ABSOLUTE paths and their routes are
 # lifted into the parent verbatim rather than Mount()ed under a prefix: the SSE
@@ -1040,6 +1043,52 @@ async def quick_covered_call_backtest(
 
 _streamable_app = mcp.http_app(path="/mcp")
 _sse_app = mcp.http_app(path="/sse", transport="sse")
+
+
+def _handler_at(sub_app: Starlette, path: str):
+    """The ASGI handler FastMCP built for `path` inside one of its sub-apps."""
+    for route in sub_app.routes:
+        if isinstance(route, Route) and route.path == path:
+            return route.app
+    raise RuntimeError(f"FastMCP registered no route at {path!r}")
+
+
+_streamable_handler = _handler_at(_streamable_app, "/mcp")
+_sse_handler = _handler_at(_sse_app, "/sse")
+
+
+class _SseEndpoint:
+    """Both transports behind the one /sse URL.
+
+    /sse is what the README has advertised for the life of this repo, and the
+    clients that followed it did not all arrive with the same transport:
+
+      * A real SSE client opens `GET /sse` and then POSTs its JSON-RPC to the
+        /messages/ URL that stream hands it.
+      * A client on the current streamable-HTTP transport POSTs JSON-RPC
+        straight at /sse. That is what the client stuck against this server
+        since at least 2026-08-11 actually sends — Cloud Run logs show POST
+        /sse and nothing else, every 1-3 seconds, from one address.
+
+    Serving only the SSE transport here would have turned that client's 404
+    into a 405, which is no more connected than before. So dispatch on the
+    shape of the request instead: a GET with no session id is an SSE
+    handshake; everything else is streamable HTTP, including the GET a
+    streamable client opens for its server-to-client stream, which always
+    carries the mcp-session-id the server issued it. Legacy SSE never sends
+    that header, so the two cases never collide.
+
+    Both paths run through the same FastMCP server and, for streamable HTTP,
+    the same session manager as /mcp — /sse and /mcp are one session space,
+    not two.
+    """
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        has_session = any(k == b"mcp-session-id" for k, _ in scope.get("headers", []))
+        if scope.get("method", "GET").upper() in ("GET", "HEAD") and not has_session:
+            await _sse_handler(scope, receive, send)
+        else:
+            await _streamable_handler(scope, receive, send)
 
 
 @asynccontextmanager
@@ -1057,7 +1106,20 @@ async def _lifespan(app: Starlette):
 
 
 app = Starlette(
-    routes=[*_streamable_app.routes, *_sse_app.routes],
+    routes=[
+        # /mcp — streamable HTTP, exactly as before.
+        *_streamable_app.routes,
+        # /sse — either transport, see _SseEndpoint.
+        Route(
+            "/sse",
+            endpoint=_SseEndpoint(),
+            methods=["GET", "HEAD", "POST", "DELETE"],
+        ),
+        # /messages/ — the SSE transport's companion POST route. Everything
+        # from the SSE sub-app except its own /sse route, which _SseEndpoint
+        # now fronts.
+        *(r for r in _sse_app.routes if getattr(r, "path", None) != "/sse"),
+    ],
     middleware=[Middleware(RequestContextMiddleware)],
     lifespan=_lifespan,
 )

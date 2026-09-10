@@ -111,18 +111,8 @@ versions of this README.
    `/sse` works too — see [Endpoints](#endpoints) — but `/mcp` is the one to
    use for a new setup.
 
-3. Restart Claude Desktop
-
-4. In a conversation, first authenticate:
-   > "Use the vibetrader authenticate tool with my token: [YOUR_TOKEN]"
-
-5. Then create bots:
-   > "Create a trading bot that buys AAPL when RSI goes below 30"
-
-### Authenticating without the `authenticate` tool
-
-If your client can send headers, put the key on every request instead — it is
-the more secure path, because the server then never holds your token at all:
+3. Send your token as a header. **Against the hosted server this is how you
+   authenticate** — see the note below:
 
 ```json
 {
@@ -134,6 +124,21 @@ the more secure path, because the server then never holds your token at all:
   }
 }
 ```
+
+4. Restart Claude Desktop
+
+5. Create bots:
+   > "Create a trading bot that buys AAPL when RSI goes below 30"
+
+### A note on the `authenticate` tool
+
+There is an `authenticate` tool, and over a **local stdio** setup
+(`python server.py stdio`) it does what you would expect: hand it your token
+once and the rest of the session is authenticated.
+
+Over **HTTP** — which is every hosted setup above — use the `Authorization`
+header instead. The header is resolved per request and stored nowhere, so it is
+also the safer of the two: the server never holds your token at all.
 
 ## Example Conversations
 
@@ -180,7 +185,7 @@ gcloud run deploy vibetrader-mcp --source . --region us-central1
 
 - Your API token is required for authentication
 - All requests are made over HTTPS
-- Tokens are resolved per request, never shared between users: an
-  `Authorization: Bearer vt_...` header is used as-is and stored nowhere, and a
-  token given to the `authenticate` tool is scoped to your MCP session only
+- Tokens are resolved per request and never shared between users: over HTTP the
+  `Authorization: Bearer vt_...` header is read from your own request and stored
+  nowhere at all
 - Paper trading mode is default for safety

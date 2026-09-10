@@ -8,6 +8,7 @@ https://gofastmcp.com/deployment/http
 import os
 import json
 import logging
+from contextlib import asynccontextmanager
 from typing import Optional
 from datetime import datetime
 
@@ -15,6 +16,9 @@ import httpx
 from dotenv import load_dotenv
 from fastmcp import FastMCP
 from fastmcp.server.dependencies import get_http_headers
+from fastmcp.server.http import RequestContextMiddleware
+from starlette.applications import Starlette
+from starlette.middleware import Middleware
 
 load_dotenv()
 
@@ -1013,10 +1017,50 @@ async def quick_covered_call_backtest(
 
 
 # =============================================================================
-# ASGI App
+# ASGI App — both HTTP transports served from one process
 # =============================================================================
+# Two transports, one Starlette parent:
+#
+#   /mcp        streamable HTTP — the modern transport. Unchanged: same path,
+#               same session semantics as before this file grew a second one.
+#   /sse        SSE — the legacy transport the README (and therefore every
+#               setup copied from GitHub) has always advertised. It comes with
+#               a companion POST route at /messages/.
+#
+# Both sub-apps are built by FastMCP with ABSOLUTE paths and their routes are
+# lifted into the parent verbatim rather than Mount()ed under a prefix: the SSE
+# transport hands the client a fixed relative "/messages/" URI that takes no
+# account of a mount prefix, so those routes have to live at the app root or
+# every SSE client posts its messages into a 404.
+#
+# RequestContextMiddleware is re-applied here because lifting the routes
+# bypasses each sub-app's own middleware stack. It is what makes
+# get_http_headers() request-scoped, which is what keeps the per-request auth
+# above (no shared global token) correct — for BOTH transports.
 
-app = mcp.http_app()
+_streamable_app = mcp.http_app(path="/mcp")
+_sse_app = mcp.http_app(path="/sse", transport="sse")
+
+
+@asynccontextmanager
+async def _lifespan(app: Starlette):
+    """Run both transports' lifespans.
+
+    The streamable-HTTP lifespan starts its StreamableHTTPSessionManager, so it
+    has to be entered. FastMCP's own server lifespan is re-entrant (it no-ops
+    once its result is set), so nesting the SSE lifespan inside is safe and
+    starts the shared server exactly once.
+    """
+    async with _streamable_app.lifespan(app):
+        async with _sse_app.lifespan(app):
+            yield
+
+
+app = Starlette(
+    routes=[*_streamable_app.routes, *_sse_app.routes],
+    middleware=[Middleware(RequestContextMiddleware)],
+    lifespan=_lifespan,
+)
 
 if __name__ == "__main__":
     import sys
@@ -1024,4 +1068,9 @@ if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "stdio":
         mcp.run()
     else:
-        mcp.run(transport="http", host="0.0.0.0", port=port)
+        import uvicorn
+
+        # Serve the combined app, not mcp.run(transport="http"), so that
+        # `python server.py` offers exactly what the deployment offers
+        # (uvicorn server:app) — both /mcp and /sse — instead of only /mcp.
+        uvicorn.run(app, host="0.0.0.0", port=port)

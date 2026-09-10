@@ -46,6 +46,18 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that c
 | `backtest_strategy` | Backtest a strategy |
 | `list_strategy_templates` | See available templates |
 
+## Endpoints
+
+The hosted server speaks both MCP HTTP transports from the same URL:
+
+| Transport | URL | Use it when |
+|-----------|-----|-------------|
+| Streamable HTTP (recommended) | `https://vibetrader-mcp-289016366682.us-central1.run.app/mcp` | Your client supports the current MCP HTTP transport. This is what the in-app setup at [vibetrader.markets/settings](https://vibetrader.markets/settings) gives you. |
+| SSE (legacy) | `https://vibetrader-mcp-289016366682.us-central1.run.app/sse` | Your client only speaks the older SSE transport. Its companion POST route is `/messages/`, which the server advertises to you automatically — you never configure it by hand. |
+
+Both transports expose the same tools and the same authentication. Prefer
+`/mcp`: SSE is deprecated upstream and is kept here for existing setups.
+
 ## Setup for Claude Desktop
 
 1. Get your API token from https://vibetrader.markets/settings
@@ -56,11 +68,27 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that c
 {
   "mcpServers": {
     "vibetrader": {
-      "url": "https://vibetrader-mcp-289016366682.us-central1.run.app/sse"
+      "command": "npx",
+      "args": ["-y", "mcp-remote", "https://vibetrader-mcp-289016366682.us-central1.run.app/mcp"]
     }
   }
 }
 ```
+
+   Clients that connect to a remote MCP URL directly (Cursor, Windsurf, and
+   Claude Desktop's own remote-server support) can use the URL on its own:
+
+```json
+{
+  "mcpServers": {
+    "vibetrader": {
+      "url": "https://vibetrader-mcp-289016366682.us-central1.run.app/mcp"
+    }
+  }
+}
+```
+
+   To use the legacy SSE transport instead, swap `/mcp` for `/sse`.
 
 3. Restart Claude Desktop
 
@@ -69,6 +97,22 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that c
 
 5. Then create bots:
    > "Create a trading bot that buys AAPL when RSI goes below 30"
+
+### Authenticating without the `authenticate` tool
+
+If your client can send headers, put the key on every request instead — it is
+the more secure path, because the server then never holds your token at all:
+
+```json
+{
+  "mcpServers": {
+    "vibetrader": {
+      "url": "https://vibetrader-mcp-289016366682.us-central1.run.app/mcp",
+      "headers": { "Authorization": "Bearer vt_YOUR_TOKEN" }
+    }
+  }
+}
+```
 
 ## Example Conversations
 
@@ -90,12 +134,18 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that c
 # Install dependencies
 pip install -r requirements.txt
 
-# Run locally (HTTP mode)
+# Run locally (HTTP mode — serves both /mcp and /sse on :8080,
+# the same app the deployment runs)
 python server.py
 
-# Run in STDIO mode (for Claude Desktop)
+# ...or exactly as the container does
+uvicorn server:app --host 0.0.0.0 --port 8080
+
+# Run in STDIO mode (for a local Claude Desktop install)
 python server.py stdio
 ```
+
+Then point a client at `http://localhost:8080/mcp` or `http://localhost:8080/sse`.
 
 ## Deployment
 
@@ -109,5 +159,7 @@ gcloud run deploy vibetrader-mcp --source . --region us-central1
 
 - Your API token is required for authentication
 - All requests are made over HTTPS
-- Tokens are not stored on the server (stateless)
+- Tokens are resolved per request, never shared between users: an
+  `Authorization: Bearer vt_...` header is used as-is and stored nowhere, and a
+  token given to the `authenticate` tool is scoped to your MCP session only
 - Paper trading mode is default for safety

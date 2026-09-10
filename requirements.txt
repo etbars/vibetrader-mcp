@@ -1,14 +1,28 @@
 # FastMCP - the correct package for HTTP deployment
-fastmcp>=2.0.0
+#
+# The ceiling is deliberate. This was a floor-only `fastmcp>=2.0.0`, so the
+# next `gcloud run deploy --source .` would have silently jumped two majors to
+# 4.x — which restructured the package (a `fastmcp` metapackage over
+# `fastmcp-slim`) and added host/origin protection to `http_app()`. That may
+# well work, but it is not what anyone tested, and it would have arrived as a
+# side effect of an unrelated deploy. Stay on the 2.x line server.py is
+# written and verified against; move the ceiling only after re-running a local
+# two-transport check against the new version.
+fastmcp>=2.14.5,<3.0.0
+
+# ASGI framework — imported directly by server.py to combine the /mcp and /sse
+# transports into one app. Version floor is fastmcp/mcp's own; the ceiling is
+# the next major.
+starlette>=0.47,<1.0
 
 # HTTP client for API calls
-httpx>=0.27.0
+httpx>=0.27.0,<1.0
 
 # ASGI server
-uvicorn>=0.27.0
+uvicorn>=0.35,<1.0
 
 # Environment
-python-dotenv>=1.0.0
+python-dotenv>=1.0.0,<2.0
 
 # Timezone support
 pytz>=2024.1

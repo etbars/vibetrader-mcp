@@ -274,7 +274,7 @@ async def get_portfolio(mode: str = "paper") -> str:
 async def get_quote(symbol: str) -> str:
     """Get current quote for a stock"""
     client = get_client()
-    return json.dumps(await client.get(f"/trading/quote/{symbol}"), indent=2)
+    return json.dumps(await client.get(f"/research/quote/{symbol}"), indent=2)
 
 
 # =============================================================================
@@ -873,7 +873,7 @@ async def run_backtest(
         if end_date:
             data["end_date"] = end_date
         
-        result = await client.post(f"/bots/{bot_id}/backtest", data)
+        result = await client.post(f"/backtest/bots/{bot_id}/backtest", data)
         
         # Format key metrics
         summary = {
@@ -910,7 +910,7 @@ async def list_backtests(bot_id: str) -> str:
     """
     try:
         client = get_client()
-        backtests = await client.get(f"/bots/{bot_id}/backtests")
+        backtests = await client.get(f"/backtest/bots/{bot_id}/backtests")
         
         if not backtests:
             return json.dumps({"message": "No backtests found for this bot", "backtests": []})
@@ -948,7 +948,7 @@ async def get_backtest(bot_id: str, backtest_id: str) -> str:
     """
     try:
         client = get_client()
-        result = await client.get(f"/bots/{bot_id}/backtests/{backtest_id}")
+        result = await client.get(f"/backtest/bots/{bot_id}/backtests/{backtest_id}")
         
         return json.dumps({
             "success": True,
@@ -997,7 +997,7 @@ async def quick_covered_call_backtest(
     """
     try:
         client = get_client()
-        result = await client.get(f"/covered-call/quick?symbol={symbol}&months={months}")
+        result = await client.get(f"/backtest/covered-call/quick?symbol={symbol}&months={months}")
         
         if not result.get("success"):
             return json.dumps({"success": False, "error": result.get("error", "Backtest failed")})

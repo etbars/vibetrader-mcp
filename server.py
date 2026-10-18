@@ -756,8 +756,14 @@ async def get_positions(mode: str = "paper") -> str:
 
 @mcp.tool()
 async def close_position(symbol: str, mode: str = "paper", qty: float = None, percentage: float = None) -> str:
-    """Close a position by symbol.
-    
+    """Close a position by symbol in the user's VibeTrader Alpaca account.
+
+    This only reaches the Alpaca account (paper or live), the same one
+    get_positions shows. It cannot sell holdings at other brokerages the user
+    linked (Robinhood, Webull, Fidelity, Coinbase and so on); if they ask for
+    that, tell them to close it in that brokerage's app. Never use this to
+    "sell my Robinhood shares": it would sell the Alpaca position instead.
+
     Args:
         symbol: Stock/crypto symbol to close (e.g., "AAPL", "BTC/USD")
         mode: Account mode - "paper" (default) or "live"
@@ -773,7 +779,12 @@ async def close_position(symbol: str, mode: str = "paper", qty: float = None, pe
         if percentage is not None:
             data["percentage"] = percentage
         
-        result = await client.post(f"/trading/portfolio/close/{symbol}?mode={mode}", data if data else None)
+        # broker is explicit: the API falls back to "alpaca" when it is
+        # missing, and an implicit default is how the wrong account got sold.
+        result = await client.post(
+            f"/trading/portfolio/close/{symbol}?mode={mode}&broker=alpaca",
+            data if data else None,
+        )
         
         return json.dumps({
             "success": True,
@@ -794,8 +805,12 @@ async def place_order(
     limit_price: float = None,
     mode: str = "paper"
 ) -> str:
-    """Place a buy or sell order.
-    
+    """Place a buy or sell order in the user's VibeTrader Alpaca account.
+
+    This only reaches the Alpaca account (paper or live). It cannot trade at
+    other brokerages the user linked (Robinhood, Webull, Fidelity, Coinbase
+    and so on); if they ask for that, tell them it isn't supported here.
+
     Args:
         symbol: Stock/crypto symbol (e.g., "AAPL", "BTC/USD")
         side: "buy" or "sell"
@@ -828,7 +843,7 @@ async def place_order(
         if limit_price:
             data["limit_price"] = limit_price
         
-        result = await client.post(f"/trading/portfolio/order?mode={mode}", data)
+        result = await client.post(f"/trading/portfolio/order?mode={mode}&broker=alpaca", data)
         
         return json.dumps({
             "success": True,

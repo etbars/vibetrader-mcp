@@ -58,6 +58,7 @@ All 30 are available over either endpoint below.
 | `get_trade_history` | Get recent trade history across all bots |
 | `get_bot_trades` | Get trade history for a specific bot |
 | `get_quote` | Get current quote for a stock |
+| `list_indicators` | List every technical indicator bots can use, with parameters and outputs (no API key needed) |
 | `get_market_status` | Check if US stock markets are currently open |
 | `run_backtest` | Run a historical backtest for a bot's current strategy |
 | `list_backtests` | List all backtests for a bot |
@@ -73,7 +74,7 @@ The hosted server speaks both MCP HTTP transports:
 | `https://vibetrader-mcp-289016366682.us-central1.run.app/mcp` | Streamable HTTP — the current MCP transport. **Use this one.** It is also what the in-app setup at [vibetrader.markets/settings](https://vibetrader.markets/settings) gives you. |
 | `https://vibetrader-mcp-289016366682.us-central1.run.app/sse` | Either transport. A client that opens an SSE stream gets one (with its companion `/messages/` POST route, which the stream advertises — you never configure it by hand); a client that POSTs JSON-RPC gets streamable HTTP, the same session space as `/mcp`. |
 
-Both URLs expose the same 30 tools and the same authentication, so an existing
+Both URLs expose the same 31 tools and the same authentication, so an existing
 `/sse` setup keeps working as-is. Prefer `/mcp` for anything new: SSE is
 deprecated upstream, and `/sse` is kept working for setups copied from older
 versions of this README.

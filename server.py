@@ -277,6 +277,28 @@ async def get_quote(symbol: str) -> str:
     return json.dumps(await client.get(f"/research/quote/{symbol}"), indent=2)
 
 
+@mcp.tool()
+async def list_indicators(family: str = "") -> str:
+    """List every technical indicator VibeTrader bots can use, with each one's
+    parameters (defaults and bounds) and outputs. Indicator math matches
+    TradingView. Optionally filter by family: moving_average, momentum, trend,
+    volatility, volume or price. Needs no API key."""
+    # The catalog is public: no token, so it works before `authenticate`.
+    async with httpx.AsyncClient() as http:
+        response = await http.get(f"{API_BASE_URL}/indicators/catalog", timeout=30.0)
+    if response.status_code >= 400:
+        raise Exception(f"API Error ({response.status_code}): {response.text or 'Unknown error'}")
+    body = response.json()
+    entries = body.get("indicators", [])
+    wanted = family.strip().lower()
+    if not wanted:
+        return json.dumps(body, indent=2)
+    out = {"version": body.get("version"), "indicators": [e for e in entries if e.get("family") == wanted]}
+    if not out["indicators"]:
+        out["families"] = sorted({e.get("family") for e in entries if e.get("family")})
+    return json.dumps(out, indent=2)
+
+
 # =============================================================================
 # Bulk Actions
 # =============================================================================

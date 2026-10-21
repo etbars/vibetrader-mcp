@@ -18,6 +18,10 @@ starlette>=0.47,<1.0
 # HTTP client for API calls
 httpx>=0.27.0,<1.0
 
+# Verifying sign-in tokens against the API's JWKS (oauth_gate.py); also what
+# the mcp SDK itself depends on.
+pyjwt[crypto]>=2.8,<3
+
 # ASGI server
 uvicorn>=0.35,<1.0
 

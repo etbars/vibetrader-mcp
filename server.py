@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 from urllib.parse import quote
 
 import httpx
+import jwt
 import pytz
 from dotenv import load_dotenv
 from fastmcp import FastMCP
@@ -901,6 +902,25 @@ def _wall_time() -> float:
     return time.time()
 
 
+def _caller_identity() -> str:
+    """Who is placing the order, stable across sign-in token refreshes.
+
+    A sign-in token is replaced every hour, so the raw bearer would give a
+    retry after a refresh a new order id — and a second order. The connection
+    (user + grant) is the caller instead; the gate already verified this
+    request's token, so reading its claims here is safe. Keys are their hash.
+    """
+    token = _resolve_token() or ""
+    if not token.startswith("vt_"):
+        try:
+            claims = jwt.decode(token, options={"verify_signature": False})
+            if claims.get("sub") and claims.get("gid"):
+                return f"grant:{claims['sub']}:{claims['gid']}"
+        except jwt.PyJWTError:
+            pass
+    return "token:" + hashlib.sha256(token.encode()).hexdigest()
+
+
 def _mcp_order_id(order: dict, mode: str, idempotency_key: Optional[str]) -> str:
     if idempotency_key:
         seed = json.dumps({"order": order, "mode": mode, "key": idempotency_key}, sort_keys=True)
@@ -908,8 +928,7 @@ def _mcp_order_id(order: dict, mode: str, idempotency_key: Optional[str]) -> str
     now = _wall_time()
     for stale in [k for k, (_, at) in _recent_order_ids.items() if now - at > ORDER_ID_WINDOW_SECONDS]:
         del _recent_order_ids[stale]
-    caller = hashlib.sha256((_resolve_token() or "").encode()).hexdigest()
-    fingerprint = json.dumps({"caller": caller, "order": order, "mode": mode}, sort_keys=True)
+    fingerprint = json.dumps({"caller": _caller_identity(), "order": order, "mode": mode}, sort_keys=True)
     remembered = _recent_order_ids.get(fingerprint)
     cid = remembered[0] if remembered else f"vt_ticket_mcp_{uuid.uuid4().hex}"
     _recent_order_ids[fingerprint] = (cid, now)
@@ -1268,9 +1287,9 @@ async def list_open_signals(bot_id: Optional[str] = None) -> str:
     """List signals waiting on the user: entries and exits a signal bot decided
     on that the user hasn't placed, skipped or reported yet.
 
-    For each one, place the order at the user's brokerage with that brokerage's
-    own tools (for Robinhood, its MCP): buy about suggested_qty, or sell qty,
-    near signal_price. Then report what really filled:
+    Each one says what to trade where the user holds the account: buy about
+    suggested_qty, or sell qty, near signal_price. Once the user has traded it,
+    report what really filled:
       side "buy" or "sell" -> report_signal
       side "option" -> report_option_signal
       side "short" -> report_short_signal

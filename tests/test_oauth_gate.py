@@ -110,7 +110,7 @@ def test_preflight_and_other_paths_pass(client):
 def test_resource_for():
     assert resource_for("mcp.vibetrader.markets", "/sse") == f"https://{BRANDED}/sse"
     assert resource_for("elsewhere.example", "/mcp") == f"https://{BRANDED}/mcp"
-    assert resource_for(f"{RUN_APP}:8080", "/messages/") == f"https://{RUN_APP}/mcp"
+    assert resource_for(f"{RUN_APP}:8080", "/messages/") == f"https://{RUN_APP}/sse"   # the SSE transport's route
 
 
 def test_the_real_server_requires_a_token():

@@ -8,7 +8,8 @@
 - Every tool says whether it only reads, and which ones can spend money or
   delete things, so clients can auto-approve reads and confirm the rest.
 - get_market_status hard-coded UTC-5: an hour wrong for half the year.
-- Session tokens set by `authenticate` expire with the session.
+- (Session tokens set by `authenticate` over HTTP were retired with sign-in;
+  see test_tool_surface.py.)
 """
 import asyncio
 import json
@@ -296,32 +297,6 @@ def test_market_status_fallback_knows_standard_time_and_weekends(monkeypatch):
     assert _status_at(monkeypatch, datetime(2026, 12, 7, 14, 45, tzinfo=timezone.utc))["is_open"] is True
     # Sat 2026-10-24 15:00 UTC: closed.
     assert _status_at(monkeypatch, datetime(2026, 10, 24, 15, 0, tzinfo=timezone.utc))["is_open"] is False
-
-
-# --- session tokens ------------------------------------------------------------
-
-def test_a_session_token_expires_once_the_session_is_idle(monkeypatch):
-    server._tokens_by_session.clear()
-    clock = [0.0]
-    monkeypatch.setattr(server, "_monotonic", lambda: clock[0])
-    server._remember_session_token("s1", "vt_a")
-    clock[0] = server.SESSION_TOKEN_IDLE_SECONDS - 1
-    assert server._session_token("s1") == "vt_a"      # a read keeps it alive
-    clock[0] += server.SESSION_TOKEN_IDLE_SECONDS - 1
-    assert server._session_token("s1") == "vt_a"
-    clock[0] += server.SESSION_TOKEN_IDLE_SECONDS + 1
-    assert server._session_token("s1") is None
-    assert "s1" not in server._tokens_by_session
-
-
-def test_storing_a_token_sweeps_out_idle_sessions(monkeypatch):
-    server._tokens_by_session.clear()
-    clock = [0.0]
-    monkeypatch.setattr(server, "_monotonic", lambda: clock[0])
-    server._remember_session_token("old", "vt_a")
-    clock[0] = server.SESSION_TOKEN_IDLE_SECONDS + 1
-    server._remember_session_token("new", "vt_b")
-    assert set(server._tokens_by_session) == {"new"}
 
 
 # --- bulk actions, list_bots, instructions -------------------------------------

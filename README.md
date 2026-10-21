@@ -31,11 +31,11 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that c
 
 ## Available Tools
 
-All 38 are available over either endpoint below.
+37 tools are available over either endpoint below. `authenticate` exists only over local stdio — hosted clients sign in instead (see [Connect](#connect)).
 
 | Tool | Description |
 |------|-------------|
-| `authenticate` | Authenticate with your API key from vibetrader.markets/settings |
+| `authenticate` | (local stdio only) Authenticate with your API key from vibetrader.markets/settings |
 | `create_bot` | Create a new trading bot using natural language |
 | `list_bots` | List all your trading bots |
 | `search_bots` | Search for bots by name |
@@ -80,94 +80,75 @@ The hosted server speaks both MCP HTTP transports:
 
 | URL | Speaks |
 |-----|--------|
-| `https://vibetrader-mcp-289016366682.us-central1.run.app/mcp` | Streamable HTTP — the current MCP transport. **Use this one.** It is also what the in-app setup at [vibetrader.markets/settings](https://vibetrader.markets/settings) gives you. |
-| `https://vibetrader-mcp-289016366682.us-central1.run.app/sse` | Either transport. A client that opens an SSE stream gets one (with its companion `/messages/` POST route, which the stream advertises — you never configure it by hand); a client that POSTs JSON-RPC gets streamable HTTP, the same session space as `/mcp`. |
+| `https://mcp.vibetrader.markets/mcp` | Streamable HTTP — the current MCP transport. **Use this one.** |
+| `https://mcp.vibetrader.markets/sse` | Either transport. A client that opens an SSE stream gets one (with its companion `/messages/` POST route, which the stream advertises — you never configure it by hand); a client that POSTs JSON-RPC gets streamable HTTP, the same session space as `/mcp`. |
 
-Both URLs expose the same 38 tools and the same authentication, so an existing
-`/sse` setup keeps working as-is. Prefer `/mcp` for anything new: SSE is
-deprecated upstream, and `/sse` is kept working for setups copied from older
-versions of this README.
+The original `https://vibetrader-mcp-289016366682.us-central1.run.app/mcp` and
+`/sse` URLs keep working, with sign-in too. Prefer `/mcp` for anything new: SSE
+is deprecated upstream.
 
-## Setup for Claude Desktop
+## Connect
 
-1. Get your API token from https://vibetrader.markets/settings
+**Claude (claude.ai, Desktop, mobile) or ChatGPT:** add a custom connector with
+`https://mcp.vibetrader.markets/mcp` and click **Connect**. You sign in to
+VibeTrader and choose what the assistant may do. No key to copy.
 
-2. Add to your Claude Desktop config (`~/Library/Application Support/Claude/claude_desktop_config.json`):
+**Claude Code:**
+
+```bash
+claude mcp add --transport http vibetrader https://mcp.vibetrader.markets/mcp
+```
+
+**`mcp-remote`** (for clients that only run local servers) signs in the same way:
 
 ```json
 {
   "mcpServers": {
     "vibetrader": {
       "command": "npx",
-      "args": ["-y", "mcp-remote", "https://vibetrader-mcp-289016366682.us-central1.run.app/mcp"]
+      "args": ["-y", "mcp-remote", "https://mcp.vibetrader.markets/mcp"]
     }
   }
 }
 ```
 
-   Clients that connect to a remote MCP URL directly (Cursor, Windsurf, and
-   Claude Desktop's own remote-server support) can use the URL on its own:
+**Clients that send a key** (Cursor, Windsurf, OpenClaw, scripts): create a key at
+https://vibetrader.markets/settings and send it as a header:
 
 ```json
 {
   "mcpServers": {
     "vibetrader": {
-      "url": "https://vibetrader-mcp-289016366682.us-central1.run.app/mcp"
+      "url": "https://mcp.vibetrader.markets/mcp",
+      "headers": { "Authorization": "Bearer vt_YOUR_KEY" }
     }
   }
 }
 ```
 
-   `/sse` works too — see [Endpoints](#endpoints) — but `/mcp` is the one to
-   use for a new setup.
+### Permissions
 
-3. Send your token as a header. **Against the hosted server this is how you
-   authenticate** — see the note below:
+Every connection — and every key — carries what the user allowed:
 
-```json
-{
-  "mcpServers": {
-    "vibetrader": {
-      "url": "https://vibetrader-mcp-289016366682.us-central1.run.app/mcp",
-      "headers": { "Authorization": "Bearer vt_YOUR_TOKEN" }
-    }
-  }
-}
-```
+| Permission | Covers |
+|------------|--------|
+| **See** (always) | bots, portfolio, trades, signals, backtests |
+| **Manage bots and signals** | create, edit, start, pause and delete paper bots and signal bots; record trades made for a signal |
+| **Place orders and run live bots** | `place_order`, `close_position`, and creating, starting or switching a bot onto a real-money account (off unless ticked) |
 
-4. Restart Claude Desktop
+The VibeTrader API enforces them on every request. A tool called outside them
+fails with a message saying how to allow it. Keys can instead have full API
+access for scripts (everything but account settings). Users disconnect an app
+in Settings → Connected apps.
 
-5. Create bots:
-   > "Create a trading bot that buys AAPL when RSI goes below 30"
+### A request without a token
 
-### A note on the `authenticate` tool
-
-There is an `authenticate` tool, and over a **local stdio** setup
-(`python server.py stdio`) it does what you would expect: hand it your token
-once and the rest of the session is authenticated.
-
-Over **HTTP** — which is every hosted setup above — use the `Authorization`
-header instead. The header is resolved per request and stored nowhere, so it is
-also the safer of the two: the server never holds your token at all.
-
-## Example Conversations
-
-**Create a momentum bot:**
-> "Create a trading bot that buys AAPL when RSI crosses below 30 and sells when it crosses above 70"
-
-**Check your bots:**
-> "Show me all my trading bots and their performance"
-
-**Backtest a strategy:**
-> "Create a moving average crossover bot for SPY and backtest it"
-
-**Covered calls:**
-> "How much would covered calls on NVDA have paid over the last 12 months?"
-
-**Trade signals at another brokerage:**
-> "Switch my RSI bot to signals. I'll place the trades on Robinhood."
->
-> "Any signals waiting? Place them on Robinhood and record the fills."
+Over HTTP every request needs `Authorization: Bearer ...` — a sign-in token or a
+`vt_` key. Without one the server answers `401` with a `WWW-Authenticate` header
+pointing at `/.well-known/oauth-protected-resource/mcp`, which names
+`https://api.vibetrader.markets` as the sign-in server; that is what makes an
+assistant show **Connect**. Pasting a key into chat (the old `authenticate` step)
+is gone over HTTP; it remains for local stdio (`python server.py stdio`).
 
 ## Signal mode: trade at any brokerage
 
@@ -208,16 +189,19 @@ Then point a client at `http://localhost:8080/mcp` or `http://localhost:8080/sse
 Deployed on Google Cloud Run at `mcp.vibetrader.markets`
 
 ```bash
-gcloud run deploy vibetrader-mcp --source . --region us-central1
+gcloud run deploy vibetrader-mcp --source . --region us-central1 --max-instances=1
 ```
+
+Keep `--max-instances=1`: `place_order`'s retry memory lives in the process.
 
 ## Security
 
-- Your API token is required for authentication
+- Every HTTP request needs a sign-in token or a key, read from that request's own
+  `Authorization` header and stored nowhere — never shared between users
+- Sign-in is OAuth 2.1 with PKCE against VibeTrader's API; tokens last an hour,
+  refresh tokens rotate, and disconnecting an app ends its access immediately
+- What a connection may do is enforced by the API, not just this server
 - All requests are made over HTTPS
-- Tokens are resolved per request and never shared between users: over HTTP the
-  `Authorization: Bearer vt_...` header is read from your own request and stored
-  nowhere at all
 - Paper trading mode is default for safety
 - Every tool declares MCP annotations, so your client can run read-only tools
   without asking and confirm the ones that trade, start bots or delete

@@ -46,22 +46,31 @@ mcp = FastMCP(
     instructions=(
         "VibeTrader runs rule-based trading bots around the clock. Create a bot in plain English, "
         "backtest it, and run it on paper, on the user's live Alpaca account, or as a signal bot that "
-        "tells the user what to trade at any brokerage. Hosted (HTTP) clients authenticate by sending "
-        "'Authorization: Bearer vt_...' with every request (the key is at vibetrader.markets/settings); "
-        "call 'authenticate' only from a client that can't send headers, or over local stdio. "
-        "place_order and close_position reach only the user's VibeTrader Alpaca account. For a "
-        "brokerage VibeTrader can't trade, such as Robinhood: put a bot in signal mode with "
-        "set_signal_mode(follow_account='manual'), read its signals with list_open_signals, place each "
-        "order with that brokerage's own tools, then record the fill with report_signal."
+        "tells the user what to trade at any brokerage. Hosted clients connect by signing in to "
+        "VibeTrader; clients without sign-in send 'Authorization: Bearer vt_...' with every request "
+        "(keys are at vibetrader.markets/settings). Each connection has permissions the user chose: see, "
+        "manage bots and signals, and place orders and run live bots; a call outside them fails with a "
+        "message saying how to allow it. place_order and close_position reach only the user's VibeTrader "
+        "Alpaca account. A signal bot (set_signal_mode) doesn't trade; its signals are listed by "
+        "list_open_signals, and once the user has traded one wherever they hold the account, "
+        "report_signal records the fill so the bot tracks the position and sends its exits."
     ),
 )
 
 # Tool annotations (MCP spec). Clients may run read-only tools without asking
 # and should confirm destructive ones. Here "destructive" means the call can
-# spend money, start trading or delete something.
-READ_ONLY = {"readOnlyHint": True}
-SAFE_WRITE = {"readOnlyHint": False, "destructiveHint": False}
-CONSEQUENTIAL = {"readOnlyHint": False, "destructiveHint": True}
+# spend money, start trading or delete something; "open world" means it reaches
+# past VibeTrader to a brokerage (an order, or a bot that will place them).
+# Every hint is explicit: both connector directories require it.
+READ_ONLY = {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False}
+SAFE_WRITE = {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False}
+CONSEQUENTIAL = {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": False}
+CONSEQUENTIAL_EXTERNAL = {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": True}
+
+
+def _tool(title: str, hints: dict, **kwargs):
+    """@mcp.tool with a title on the tool and in its annotations."""
+    return mcp.tool(title=title, annotations={**hints, "title": title}, **kwargs)
 
 
 # =============================================================================
@@ -146,49 +155,17 @@ class VibeTraderClient:
 # mutating strangers' real-money accounts.
 #
 # Tokens are now resolved PER REQUEST, in priority order:
-#   1. The request's own `Authorization: Bearer vt_...` header (stateless
-#      clients that send the key on every call — the most secure path).
-#   2. A token stored against THIS MCP session id by the `authenticate` tool
-#      (preserves the "authenticate once" UX; isolated per session).
-#   3. A single-process fallback for local stdio use (no HTTP context, one
-#      user) — never reachable when running under HTTP.
+#   1. The request's own `Authorization: Bearer ...` header: a sign-in token
+#      issued to this AI app, or a vt_ key. Over HTTP nothing else is accepted
+#      (oauth_gate.py answers a request without one with 401 — "Connect").
+#   2. A single-process fallback for local stdio use (no HTTP context, one
+#      user, set by `authenticate`) — never reachable when running under HTTP.
 #
 # get_http_headers() is request-scoped via contextvars, so each concurrent
 # task sees only its own request — that is what fixes the cross-user bleed.
 
-# session_id -> (validated vt_ key, when last used by a tool call). Only used
-# under HTTP (multi-user). Entries are dropped once unused this long, so the map
-# can't grow forever. It is far longer than the MCP SDK's own 30-minute session
-# timeout because pings keep a session alive without touching this map; a
-# session the SDK already closed can't be reached through it anyway.
-SESSION_TOKEN_IDLE_SECONDS = 12 * 60 * 60
-_tokens_by_session: dict[str, tuple[str, float]] = {}
 # Local stdio single-user fallback (no HTTP request context exists).
 _stdio_token: Optional[str] = None
-
-
-def _monotonic() -> float:
-    return time.monotonic()
-
-
-def _remember_session_token(sid: str, token: str) -> None:
-    now = _monotonic()
-    for stale in [s for s, (_, seen) in _tokens_by_session.items() if now - seen > SESSION_TOKEN_IDLE_SECONDS]:
-        del _tokens_by_session[stale]
-    _tokens_by_session[sid] = (token, now)
-
-
-def _session_token(sid: str) -> Optional[str]:
-    entry = _tokens_by_session.get(sid)
-    if entry is None:
-        return None
-    token, seen = entry
-    now = _monotonic()
-    if now - seen > SESSION_TOKEN_IDLE_SECONDS:
-        del _tokens_by_session[sid]
-        return None
-    _tokens_by_session[sid] = (token, now)
-    return token
 
 
 def _http_headers() -> dict:
@@ -201,10 +178,6 @@ def _http_headers() -> dict:
 
 def _is_http_context() -> bool:
     return bool(_http_headers())
-
-
-def _session_id() -> Optional[str]:
-    return _http_headers().get("mcp-session-id")
 
 
 def _request_bearer() -> Optional[str]:
@@ -239,13 +212,7 @@ def _resolve_token() -> Optional[str]:
     token = _request_bearer()
     if token:
         return token
-    # 2. Per-session token set via the authenticate tool (HTTP, multi-user).
-    sid = _session_id()
-    if sid:
-        token = _session_token(sid)
-        if token:
-            return token
-    # 3. Local stdio single-user fallback (no HTTP context).
+    # 2. Local stdio single-user fallback (no HTTP context).
     if not _is_http_context():
         return _stdio_token
     return None
@@ -255,8 +222,8 @@ def get_client() -> VibeTraderClient:
     token = _resolve_token()
     if not token:
         raise ToolError(
-            "Not authenticated! Send your API key as an 'Authorization: Bearer vt_...' header, "
-            "or use the 'authenticate' tool if your client can't send headers."
+            "Not signed in. Connect VibeTrader in your AI app (it will ask you to sign in), or send "
+            "'Authorization: Bearer vt_...' with a key from vibetrader.markets/settings."
         )
     return VibeTraderClient(token)
 
@@ -265,38 +232,33 @@ def get_client() -> VibeTraderClient:
 # Core Tools
 # =============================================================================
 
-@mcp.tool(annotations=SAFE_WRITE)
+@_tool("Sign in with an API key", SAFE_WRITE, enabled=False)
 async def authenticate(api_key: str) -> str:
     """Authenticate with your API key from vibetrader.markets/settings"""
     success, result = await validate_token(api_key)
     if not success:
         raise ToolError(f"Authentication failed: {result}")
+    if _is_http_context():
+        # Unreachable through the gate in practice (no token, no request), and
+        # never stored: over HTTP the key belongs in a header, per request.
+        return (f"✅ Key valid for {result}. Send it as 'Authorization: Bearer {api_key[:6]}...' "
+                "with each request instead.")
+    # Local stdio: single user, safe to hold in-process.
+    global _stdio_token
+    _stdio_token = api_key
+    return f"✅ Authenticated as {result}. You can now use all tools!"
 
-    # Store the validated key scoped to THIS caller only — never a shared
-    # global (see the per-request auth section above for why).
-    sid = _session_id()
-    if sid:
-        _remember_session_token(sid, api_key)
-        return f"✅ Authenticated as {result}. You can now use all tools!"
-    if not _is_http_context():
-        # Local stdio: single user, safe to hold in-process.
-        global _stdio_token
-        _stdio_token = api_key
-        return f"✅ Authenticated as {result}. You can now use all tools!"
-    # HTTP request with no session id (unusual): can't isolate safely, so
-    # don't store a shared token. Direct the client to header auth instead.
-    return (
-        f"✅ Key valid for {result}, but this client didn't supply an MCP "
-        f"session. Configure your MCP client to send "
-        f"'Authorization: Bearer {api_key[:6]}...' on each request."
-    )
+
+def _enable_stdio_tools() -> None:
+    """Over local stdio there is no sign-in; the key comes through authenticate."""
+    authenticate.enable()
 
 
 def _is_signal_bot(bot: dict) -> bool:
     return "alert" in (bot.get("entry_mode"), bot.get("exit_mode"))
 
 
-@mcp.tool(annotations=READ_ONLY)
+@_tool("List bots", READ_ONLY)
 async def list_bots(mode: Optional[str] = None, limit: int = 100) -> str:
     """List all your trading bots.
 
@@ -323,14 +285,14 @@ async def list_bots(mode: Optional[str] = None, limit: int = 100) -> str:
     return json.dumps(out, indent=2)
 
 
-@mcp.tool(annotations=READ_ONLY)
+@_tool("Get bot", READ_ONLY)
 async def get_bot(bot_id: str) -> str:
     """Get details of a specific bot"""
     client = get_client()
     return json.dumps(await client.get(f"/bots/{bot_id}"), indent=2)
 
 
-@mcp.tool(annotations=SAFE_WRITE)
+@_tool("Create bot", SAFE_WRITE)
 async def create_bot(prompt: str, name: Optional[str] = None) -> str:
     """Create a new trading bot using natural language"""
     client = get_client()
@@ -341,7 +303,7 @@ async def create_bot(prompt: str, name: Optional[str] = None) -> str:
     return json.dumps({"status": "success", "bot": {"id": bot.get("id"), "name": bot.get("name")}}, indent=2)
 
 
-@mcp.tool(annotations=CONSEQUENTIAL)
+@_tool("Start bot", CONSEQUENTIAL_EXTERNAL)
 async def start_bot(bot_id: str) -> str:
     """Start a paused bot"""
     client = get_client()
@@ -349,7 +311,7 @@ async def start_bot(bot_id: str) -> str:
     return "✅ Bot started"
 
 
-@mcp.tool(annotations=SAFE_WRITE)
+@_tool("Pause bot", SAFE_WRITE)
 async def pause_bot(bot_id: str) -> str:
     """Pause a running bot"""
     client = get_client()
@@ -357,7 +319,7 @@ async def pause_bot(bot_id: str) -> str:
     return "✅ Bot paused"
 
 
-@mcp.tool(annotations=CONSEQUENTIAL)
+@_tool("Delete bot", CONSEQUENTIAL)
 async def delete_bot(bot_id: str) -> str:
     """Delete a bot"""
     client = get_client()
@@ -365,7 +327,7 @@ async def delete_bot(bot_id: str) -> str:
     return "✅ Bot deleted"
 
 
-@mcp.tool(annotations=READ_ONLY)
+@_tool("Get portfolio", READ_ONLY)
 async def get_portfolio(mode: str = "paper") -> str:
     """Get portfolio positions and balance.
     
@@ -378,14 +340,14 @@ async def get_portfolio(mode: str = "paper") -> str:
     return json.dumps({"mode": mode, "account": account, "positions": positions}, indent=2)
 
 
-@mcp.tool(annotations=READ_ONLY)
+@_tool("Get quote", READ_ONLY)
 async def get_quote(symbol: str) -> str:
     """Get current quote for a stock"""
     client = get_client()
     return json.dumps(await client.get(f"/research/quote/{symbol}"), indent=2)
 
 
-@mcp.tool(annotations=READ_ONLY)
+@_tool("List indicators", READ_ONLY)
 async def list_indicators(family: str = "") -> str:
     """List every technical indicator VibeTrader bots can use, with each one's
     parameters (defaults and bounds) and outputs. Indicator math matches
@@ -430,7 +392,7 @@ async def _for_each_bot(bots: list, act, done_verb: str, verb: str, mode: Option
     return message
 
 
-@mcp.tool(annotations=SAFE_WRITE)
+@_tool("Pause all bots", SAFE_WRITE)
 async def pause_all_bots(mode: Optional[str] = None) -> str:
     """Pause all running bots at once.
 
@@ -450,7 +412,7 @@ async def pause_all_bots(mode: Optional[str] = None) -> str:
                                "Paused", "pause", mode)
 
 
-@mcp.tool(annotations=CONSEQUENTIAL)
+@_tool("Start all bots", CONSEQUENTIAL_EXTERNAL)
 async def start_all_bots(mode: Optional[str] = None) -> str:
     """Start all paused bots at once.
 
@@ -470,7 +432,7 @@ async def start_all_bots(mode: Optional[str] = None) -> str:
                                "Started", "start", mode)
 
 
-@mcp.tool(annotations=CONSEQUENTIAL)
+@_tool("Delete all bots", CONSEQUENTIAL)
 async def delete_all_bots(confirm: str, mode: Optional[str] = None) -> str:
     """Delete ALL bots. Requires confirm='DELETE ALL' to proceed.
 
@@ -497,7 +459,7 @@ async def delete_all_bots(confirm: str, mode: Optional[str] = None) -> str:
 # Utility Tools
 # =============================================================================
 
-@mcp.tool(annotations=READ_ONLY)
+@_tool("Get bot stats", READ_ONLY)
 async def get_bot_stats(mode: Optional[str] = None) -> str:
     """Get aggregate statistics across your bots.
     
@@ -537,7 +499,7 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-@mcp.tool(annotations=READ_ONLY)
+@_tool("Get market status", READ_ONLY)
 async def get_market_status() -> str:
     """Check whether the US stock market is open now, with its next open and
     close. Reads the exchange clock (holidays and early closes included)."""
@@ -564,7 +526,7 @@ async def get_market_status() -> str:
     }, indent=2)
 
 
-@mcp.tool(annotations=READ_ONLY)
+@_tool("Get account summary", READ_ONLY)
 async def get_account_summary(mode: str = "paper") -> str:
     """Get account balance, buying power, and key metrics.
     
@@ -583,7 +545,7 @@ async def get_account_summary(mode: str = "paper") -> str:
     }, indent=2)
 
 
-@mcp.tool(annotations=READ_ONLY)
+@_tool("Search bots", READ_ONLY)
 async def search_bots(query: str) -> str:
     """Search for bots by name"""
     client = get_client()
@@ -602,7 +564,7 @@ async def search_bots(query: str) -> str:
 # Trade History Tools
 # =============================================================================
 
-@mcp.tool(annotations=READ_ONLY)
+@_tool("Get trade history", READ_ONLY)
 async def get_trade_history(mode: str = "paper", limit: int = 20) -> str:
     """Get recent trade history across all bots.
     
@@ -637,7 +599,7 @@ async def get_trade_history(mode: str = "paper", limit: int = 20) -> str:
     }, indent=2)
 
 
-@mcp.tool(annotations=READ_ONLY)
+@_tool("Get bot trades", READ_ONLY)
 async def get_bot_trades(bot_id: str, limit: int = 20) -> str:
     """Get trade history for a specific bot.
     
@@ -683,7 +645,7 @@ async def get_bot_trades(bot_id: str, limit: int = 20) -> str:
     }, indent=2)
 
 
-@mcp.tool(annotations=READ_ONLY)
+@_tool("Get daily trade stats", READ_ONLY)
 async def get_daily_trade_stats(bot_id: str, days: int = 30) -> str:
     """Get daily trading statistics for a bot.
     
@@ -724,7 +686,7 @@ async def get_daily_trade_stats(bot_id: str, days: int = 30) -> str:
 # Strategy Tools
 # =============================================================================
 
-@mcp.tool(annotations=READ_ONLY)
+@_tool("Get bot strategy", READ_ONLY)
 async def get_bot_strategy(bot_id: str) -> str:
     """Get the full strategy configuration for a bot.
 
@@ -756,7 +718,7 @@ async def get_bot_strategy(bot_id: str) -> str:
     }, indent=2)
 
 
-@mcp.tool(annotations=READ_ONLY)
+@_tool("Explain bot strategy", READ_ONLY)
 async def explain_bot_strategy(bot_id: str) -> str:
     """Get a plain English explanation of a bot's strategy.
 
@@ -776,7 +738,7 @@ async def explain_bot_strategy(bot_id: str) -> str:
     }, indent=2)
 
 
-@mcp.tool(annotations=SAFE_WRITE)
+@_tool("Refine bot", SAFE_WRITE)
 async def refine_bot(bot_id: str, prompt: str) -> str:
     """Refine a bot's strategy using natural language.
 
@@ -801,7 +763,7 @@ async def refine_bot(bot_id: str, prompt: str) -> str:
     }, indent=2)
 
 
-@mcp.tool(annotations=CONSEQUENTIAL)
+@_tool("Update bot", CONSEQUENTIAL)
 async def update_bot(bot_id: str, name: str = None, status: str = None) -> str:
     """Update a bot's name or status.
 
@@ -836,7 +798,7 @@ async def update_bot(bot_id: str, name: str = None, status: str = None) -> str:
 # Trading Tools
 # =============================================================================
 
-@mcp.tool(annotations=READ_ONLY)
+@_tool("Get positions", READ_ONLY)
 async def get_positions(mode: str = "paper") -> str:
     """Get current open positions with unrealized P&L.
 
@@ -880,7 +842,7 @@ async def get_positions(mode: str = "paper") -> str:
     }, indent=2)
 
 
-@mcp.tool(annotations=CONSEQUENTIAL)
+@_tool("Close position", CONSEQUENTIAL_EXTERNAL)
 async def close_position(symbol: str, mode: str = "paper", qty: float = None, percentage: float = None) -> str:
     """Close a position by symbol in the user's VibeTrader Alpaca account.
 
@@ -954,7 +916,7 @@ def _mcp_order_id(order: dict, mode: str, idempotency_key: Optional[str]) -> str
     return cid
 
 
-@mcp.tool(annotations=CONSEQUENTIAL)
+@_tool("Place order", CONSEQUENTIAL_EXTERNAL)
 async def place_order(
     symbol: str,
     side: str,
@@ -1037,7 +999,7 @@ async def place_order(
 # Backtest Tools
 # =============================================================================
 
-@mcp.tool(annotations=SAFE_WRITE)
+@_tool("Run backtest", SAFE_WRITE)
 async def run_backtest(
     bot_id: str,
     start_date: str = None,
@@ -1089,7 +1051,7 @@ async def run_backtest(
     return json.dumps(summary, indent=2)
 
 
-@mcp.tool(annotations=READ_ONLY)
+@_tool("List backtests", READ_ONLY)
 async def list_backtests(bot_id: str) -> str:
     """
     List all backtests for a bot.
@@ -1123,7 +1085,7 @@ async def list_backtests(bot_id: str) -> str:
     }, indent=2)
 
 
-@mcp.tool(annotations=READ_ONLY)
+@_tool("Get backtest", READ_ONLY)
 async def get_backtest(bot_id: str, backtest_id: str) -> str:
     """
     Get detailed results for a specific backtest.
@@ -1161,7 +1123,7 @@ async def get_backtest(bot_id: str, backtest_id: str) -> str:
     }, indent=2)
 
 
-@mcp.tool(annotations=READ_ONLY)
+@_tool("Quick covered-call backtest", READ_ONLY)
 async def quick_covered_call_backtest(
     symbol: str = "NVDA",
     months: int = 12
@@ -1200,7 +1162,7 @@ async def quick_covered_call_backtest(
     }, indent=2)
 
 
-@mcp.tool(annotations=READ_ONLY)
+@_tool("Preview bot", READ_ONLY)
 async def preview_bot(bot_id: str) -> str:
     """Quick 30-day backtest of a bot, not saved: estimated profit and return,
     trade count and win rate. Use it right after create_bot to see whether the
@@ -1246,7 +1208,7 @@ def _public_signal(signal: dict, bot_id: str, bot_name: Optional[str] = None) ->
     return out
 
 
-@mcp.tool(annotations=CONSEQUENTIAL)
+@_tool("Set signal mode", CONSEQUENTIAL_EXTERNAL)
 async def set_signal_mode(
     bot_id: str,
     entry_mode: Literal["alert", "auto"] = "alert",
@@ -1301,7 +1263,7 @@ async def set_signal_mode(
     return json.dumps(result, indent=2, default=str)
 
 
-@mcp.tool(annotations=READ_ONLY)
+@_tool("List open signals", READ_ONLY)
 async def list_open_signals(bot_id: Optional[str] = None) -> str:
     """List signals waiting on the user: entries and exits a signal bot decided
     on that the user hasn't placed, skipped or reported yet.
@@ -1356,7 +1318,7 @@ _FILL_ACTIONS = ("bought", "sold")
 _SIGNAL_ACTIONS = ("bought", "sold", "skip", "keep", "undo")
 
 
-@mcp.tool(annotations=SAFE_WRITE)
+@_tool("Report a signal trade", SAFE_WRITE)
 async def report_signal(
     bot_id: str,
     decision_id: str,
@@ -1407,7 +1369,7 @@ def _resolution(action: str, qty: Optional[float], price: Optional[float]) -> di
 _OPTION_SIGNAL_ACTIONS = ("sold", "skip", "expired", "assigned", "called_away", "bought")
 
 
-@mcp.tool(annotations=SAFE_WRITE)
+@_tool("Report an option signal trade", SAFE_WRITE)
 async def report_option_signal(
     bot_id: str,
     decision_id: str,
@@ -1440,7 +1402,7 @@ async def report_option_signal(
 _SHORT_SIGNAL_ACTIONS = ("shorted", "skip", "covered", "keep")
 
 
-@mcp.tool(annotations=SAFE_WRITE)
+@_tool("Report a short signal trade", SAFE_WRITE)
 async def report_short_signal(
     bot_id: str,
     decision_id: str,
@@ -1468,7 +1430,7 @@ async def report_short_signal(
     return json.dumps(result, indent=2, default=str)
 
 
-@mcp.tool(annotations=READ_ONLY)
+@_tool("Get signal state", READ_ONLY)
 async def get_signal_state(bot_id: str) -> str:
     """A signal bot's setup and record: its entry and exit modes (and why a
     side may be alerting instead of trading), the account it follows, the
@@ -1601,6 +1563,7 @@ if __name__ == "__main__":
     import sys
     port = int(os.getenv("PORT", 8080))
     if len(sys.argv) > 1 and sys.argv[1] == "stdio":
+        _enable_stdio_tools()
         mcp.run()
     else:
         import uvicorn

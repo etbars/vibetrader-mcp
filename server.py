@@ -7,12 +7,14 @@ https://gofastmcp.com/deployment/http
 
 import os
 import json
+import asyncio
 import hashlib
 import logging
 import time
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Literal, Optional
 from datetime import datetime, timezone
+from urllib.parse import quote
 
 import httpx
 import pytz
@@ -1160,6 +1162,279 @@ async def quick_covered_call_backtest(
         "total_assignments": result.get("assignments", 0),
         "calls_sold": result.get("calls_sold", 0)
     }, indent=2)
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def preview_bot(bot_id: str) -> str:
+    """Quick 30-day backtest of a bot, not saved: estimated profit and return,
+    trade count and win rate. Use it right after create_bot to see whether the
+    strategy trades at all before running it.
+
+    Args:
+        bot_id: The bot ID to preview
+    """
+    client = get_client()
+    return json.dumps(await client.get(f"/backtest/bots/{_seg(bot_id)}/preview"), indent=2, default=str)
+
+
+# =============================================================================
+# Signal Mode Tools
+# =============================================================================
+# A signal bot decides and the user trades, wherever their money is: that
+# includes brokerages VibeTrader can't trade, such as Robinhood through its own
+# MCP tools. The loop is set_signal_mode -> list_open_signals -> place the order
+# there -> report_signal. The API side is the 2026-10-14 signal-mode spec.
+
+def _seg(value: str) -> str:
+    """One URL path segment."""
+    return quote(str(value), safe="")
+
+
+# Delivery bookkeeping on a signal; nothing an agent acts on.
+_SIGNAL_INTERNAL = ("delivered", "delivery_attempts", "reminder_sent_at")
+# The bot's own order for the signal is working (the API's AUTO_ACTIVE): the
+# API refuses to resolve it until that order settles.
+_BOT_PLACING = ("pending", "submitting", "submitted")
+_STATE_READS_AT_ONCE = 8
+
+
+def _bot_placing(signal: dict) -> bool:
+    return (signal.get("auto") or {}).get("state") in _BOT_PLACING
+
+
+def _public_signal(signal: dict, bot_id: str, bot_name: Optional[str] = None) -> dict:
+    out = {k: v for k, v in signal.items() if k not in _SIGNAL_INTERNAL}
+    out["bot_id"] = bot_id
+    if bot_name:
+        out["bot_name"] = bot_name
+    return out
+
+
+@mcp.tool(annotations=CONSEQUENTIAL)
+async def set_signal_mode(
+    bot_id: str,
+    entry_mode: Literal["alert", "auto"] = "alert",
+    exit_mode: Literal["alert", "auto"] = "alert",
+    follow_account: str = "manual",
+    signal_capital: Optional[float] = None,
+) -> str:
+    """Switch a bot between placing its own trades and sending signals.
+
+    On an "alert" side the bot still makes every decision, but instead of
+    trading it sends a signal (push, email, webhook, and list_open_signals):
+    the user places the trade and reports it with report_signal. An "auto" side
+    places the order itself. Each side is set on its own, e.g. alert entries
+    with auto exits; "auto" on both turns signals off.
+
+    To switch to signals, a running bot must be paused first and hold no
+    positions, and live bots can't switch: create a new bot for signals.
+    Signals need a paid plan once the user's 30-day free window ends.
+
+    Args:
+        bot_id: The bot to switch
+        entry_mode: "alert" (default) or "auto" for entries
+        exit_mode: "alert" (default) or "auto" for exits
+        follow_account: Where the user places these trades. "manual" (default)
+            means any brokerage VibeTrader can't trade, such as Robinhood: the
+            user reports each fill with report_signal. Or a connected account:
+            "alpaca_paper", "alpaca_live", or another connected brokerage
+            account's key.
+        signal_capital: Dollars the user trades this bot with. Required with
+            "manual" when the bot sizes by percent of portfolio or ATR risk,
+            so each signal can say how much to buy.
+    """
+    for side, mode in (("entry_mode", entry_mode), ("exit_mode", exit_mode)):
+        if mode not in ("alert", "auto"):
+            raise ToolError(f"{side} must be 'alert' or 'auto'")
+    data = {"entry_mode": entry_mode, "exit_mode": exit_mode, "follow_account": follow_account}
+    if signal_capital is not None:
+        data["signal_capital"] = signal_capital
+    result = await get_client().post(f"/signals/bots/{_seg(bot_id)}/mode", data)
+    return json.dumps(result, indent=2, default=str)
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def list_open_signals(bot_id: Optional[str] = None) -> str:
+    """List signals waiting on the user: entries and exits a signal bot decided
+    on that the user hasn't placed, skipped or reported yet.
+
+    For each one, place the order at the user's brokerage with that brokerage's
+    own tools (for Robinhood, its MCP): buy about suggested_qty, or sell qty,
+    near signal_price. Then report what really filled:
+      side "buy" or "sell" -> report_signal
+      side "option" -> report_option_signal
+      side "short" -> report_short_signal
+    Signals the bot is placing itself (auto mode) are counted in
+    being_placed_by_bot and left out: there is nothing to do for them.
+
+    Args:
+        bot_id: One bot's signals. Omit it for every signal bot.
+    """
+    client = get_client()
+    if bot_id:
+        targets = [{"id": bot_id}]
+    else:
+        targets = [b for b in await client.get("/bots/") if _is_signal_bot(b)]
+
+    gate = asyncio.Semaphore(_STATE_READS_AT_ONCE)
+
+    async def read(bot: dict):
+        async with gate:
+            return await client.get(f"/signals/bots/{_seg(bot['id'])}")
+
+    states = await asyncio.gather(*(read(b) for b in targets), return_exceptions=True)
+    open_signals, placing, errors = [], 0, []
+    for bot, state in zip(targets, states):
+        if isinstance(state, Exception):
+            if bot_id:
+                raise state
+            errors.append({"bot_id": bot["id"], "bot_name": bot.get("name"), "error": str(state)})
+            continue
+        for signal in state.get("signals") or []:
+            if signal.get("status") != "open":
+                continue
+            if _bot_placing(signal):
+                placing += 1
+                continue
+            open_signals.append(_public_signal(signal, bot["id"], bot.get("name")))
+
+    out = {"count": len(open_signals), "open_signals": open_signals, "being_placed_by_bot": placing}
+    if errors:
+        out["errors"] = errors
+    return json.dumps(out, indent=2, default=str)
+
+
+_FILL_ACTIONS = ("bought", "sold")
+_SIGNAL_ACTIONS = ("bought", "sold", "skip", "keep", "undo")
+
+
+@mcp.tool(annotations=SAFE_WRITE)
+async def report_signal(
+    bot_id: str,
+    decision_id: str,
+    action: Literal["bought", "sold", "skip", "keep", "undo"],
+    qty: Optional[float] = None,
+    price: Optional[float] = None,
+) -> str:
+    """Tell a signal bot what the user did with one of its stock or crypto
+    signals (side "buy" or "sell"), so the bot tracks the user's real shares
+    and results. This records what happened; it never places an order.
+
+    Actions:
+      bought: the user bought on a buy signal. qty and price are the real fill.
+      sold: the user sold on a sell signal. qty and price are the real fill.
+      skip: the user passed on the signal.
+      keep: on a sell signal, the user keeps holding the shares.
+      undo: a buy VibeTrader detected at a connected brokerage wasn't for this
+        signal. Releases those shares and reopens the signal; never sells.
+
+    Args:
+        bot_id: The signal bot
+        decision_id: The signal's decision_id, from list_open_signals
+        action: bought, sold, skip, keep or undo
+        qty: Shares or units filled (bought and sold only)
+        price: Average fill price per share or unit (bought and sold only)
+    """
+    if action not in _SIGNAL_ACTIONS:
+        raise ToolError("action must be bought, sold, skip, keep or undo")
+    data = None
+    if action in _FILL_ACTIONS:
+        if not qty or not price or qty <= 0 or price <= 0:
+            raise ToolError(f"'{action}' needs the fill's qty and price, both above 0")
+        data = {"qty": qty, "price": price}
+    result = await get_client().post(
+        f"/signals/bots/{_seg(bot_id)}/signals/{_seg(decision_id)}/{action}", data)
+    return json.dumps(result, indent=2, default=str)
+
+
+def _resolution(action: str, qty: Optional[float], price: Optional[float]) -> dict:
+    data = {"action": action}
+    if qty is not None:
+        data["qty"] = qty
+    if price is not None:
+        data["price"] = price
+    return data
+
+
+_OPTION_SIGNAL_ACTIONS = ("sold", "skip", "expired", "assigned", "called_away", "bought")
+
+
+@mcp.tool(annotations=SAFE_WRITE)
+async def report_option_signal(
+    bot_id: str,
+    decision_id: str,
+    action: Literal["sold", "skip", "expired", "assigned", "called_away", "bought"],
+    qty: Optional[float] = None,
+    price: Optional[float] = None,
+) -> str:
+    """Tell an options signal bot (covered calls, cash-secured puts, the wheel)
+    what the user did with one of its option signals (side "option"). The
+    signal's option.action says which actions apply:
+      sell_to_open: sold (qty = contracts, price = premium per share) or skip
+      settle: expired, assigned or called_away, as the contract ended
+      buy_shares: bought (qty and price of the shares) or skip
+    This records what happened; it never places an order.
+
+    Args:
+        bot_id: The signal bot
+        decision_id: The signal's decision_id, from list_open_signals
+        action: One of the actions above
+        qty: Contracts (sold) or shares (bought), when the action has a fill
+        price: Premium per share (sold) or share price (bought)
+    """
+    if action not in _OPTION_SIGNAL_ACTIONS:
+        raise ToolError("action must be sold, skip, expired, assigned, called_away or bought")
+    result = await get_client().post(
+        f"/signals/bots/{_seg(bot_id)}/signals/{_seg(decision_id)}/option", _resolution(action, qty, price))
+    return json.dumps(result, indent=2, default=str)
+
+
+_SHORT_SIGNAL_ACTIONS = ("shorted", "skip", "covered", "keep")
+
+
+@mcp.tool(annotations=SAFE_WRITE)
+async def report_short_signal(
+    bot_id: str,
+    decision_id: str,
+    action: Literal["shorted", "skip", "covered", "keep"],
+    qty: Optional[float] = None,
+    price: Optional[float] = None,
+) -> str:
+    """Tell a signal bot what the user did with one of its short signals
+    (side "short"). The signal's short.action says which actions apply:
+      open: shorted (qty and the price sold short at) or skip
+      cover: covered (the price bought back at; qty if only part) or keep
+    This records what happened; it never places an order.
+
+    Args:
+        bot_id: The signal bot
+        decision_id: The signal's decision_id, from list_open_signals
+        action: shorted, skip, covered or keep
+        qty: Shares shorted or covered
+        price: Price sold short at, or bought back at
+    """
+    if action not in _SHORT_SIGNAL_ACTIONS:
+        raise ToolError("action must be shorted, skip, covered or keep")
+    result = await get_client().post(
+        f"/signals/bots/{_seg(bot_id)}/signals/{_seg(decision_id)}/short", _resolution(action, qty, price))
+    return json.dumps(result, indent=2, default=str)
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def get_signal_state(bot_id: str) -> str:
+    """A signal bot's setup and record: its entry and exit modes (and why a
+    side may be alerting instead of trading), the account it follows, the
+    user's book (what the user really holds for this bot), the bot's own
+    virtual book, results, and its open and ten most recent signals.
+
+    Args:
+        bot_id: The signal bot
+    """
+    state = dict(await get_client().get(f"/signals/bots/{_seg(bot_id)}"))
+    signals = state.pop("signals", None) or []
+    state["open_signal_count"] = sum(1 for s in signals if s.get("status") == "open")
+    state["recent_signals"] = [_public_signal(s, bot_id) for s in signals[:10]]
+    return json.dumps(state, indent=2, default=str)
 
 
 # =============================================================================

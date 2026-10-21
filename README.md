@@ -24,12 +24,14 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that c
 - **Create Bots**: Create AI-powered trading bots using natural language
 - **Manage Bots**: Start, pause, delete, and monitor your bots
 - **Portfolio**: View positions and account balance
-- **Market Data**: Get quotes and options chains
+- **Market Data**: Get quotes and the market clock
+- **Signal Mode**: Bots that tell you what to trade at any brokerage, including ones VibeTrader
+  can't trade such as Robinhood, and track the fills you report back
 - **Backtesting**: Test strategies on historical data
 
 ## Available Tools
 
-All 30 are available over either endpoint below.
+All 38 are available over either endpoint below.
 
 | Tool | Description |
 |------|-------------|
@@ -53,17 +55,24 @@ All 30 are available over either endpoint below.
 | `get_portfolio` | Get portfolio positions and balance |
 | `get_positions` | Get current open positions with unrealized P&L |
 | `get_account_summary` | Get account balance, buying power, and key metrics |
-| `close_position` | Close a position by symbol |
-| `place_order` | Place a buy or sell order |
+| `close_position` | Close a position by symbol (Alpaca account) |
+| `place_order` | Place a buy or sell order (Alpaca account; a retry is never placed twice) |
 | `get_trade_history` | Get recent trade history across all bots |
 | `get_bot_trades` | Get trade history for a specific bot |
 | `get_quote` | Get current quote for a stock |
 | `list_indicators` | List every technical indicator bots can use, with parameters and outputs (no API key needed) |
 | `get_market_status` | Check if US stock markets are currently open |
+| `preview_bot` | Quick 30-day backtest of a bot, not saved |
 | `run_backtest` | Run a historical backtest for a bot's current strategy |
 | `list_backtests` | List all backtests for a bot |
 | `get_backtest` | Get detailed results for a specific backtest |
 | `quick_covered_call_backtest` | Run a quick covered call income strategy backtest |
+| `set_signal_mode` | Switch a bot between placing its own trades and sending signals |
+| `list_open_signals` | Signals waiting for you to place, across your signal bots |
+| `report_signal` | Record what you did with a stock or crypto signal (bought, sold, skip, keep, undo) |
+| `report_option_signal` | Record what you did with an option signal |
+| `report_short_signal` | Record what you did with a short signal |
+| `get_signal_state` | A signal bot's modes, books, results and recent signals |
 
 ## Endpoints
 
@@ -74,7 +83,7 @@ The hosted server speaks both MCP HTTP transports:
 | `https://vibetrader-mcp-289016366682.us-central1.run.app/mcp` | Streamable HTTP — the current MCP transport. **Use this one.** It is also what the in-app setup at [vibetrader.markets/settings](https://vibetrader.markets/settings) gives you. |
 | `https://vibetrader-mcp-289016366682.us-central1.run.app/sse` | Either transport. A client that opens an SSE stream gets one (with its companion `/messages/` POST route, which the stream advertises — you never configure it by hand); a client that POSTs JSON-RPC gets streamable HTTP, the same session space as `/mcp`. |
 
-Both URLs expose the same 31 tools and the same authentication, so an existing
+Both URLs expose the same 38 tools and the same authentication, so an existing
 `/sse` setup keeps working as-is. Prefer `/mcp` for anything new: SSE is
 deprecated upstream, and `/sse` is kept working for setups copied from older
 versions of this README.
@@ -150,10 +159,30 @@ also the safer of the two: the server never holds your token at all.
 > "Show me all my trading bots and their performance"
 
 **Backtest a strategy:**
-> "Backtest a moving average crossover strategy on SPY for the last 6 months"
+> "Create a moving average crossover bot for SPY and backtest it"
 
-**Options trading:**
-> "Create an iron condor bot for SPY that enters when IV rank is above 50"
+**Covered calls:**
+> "How much would covered calls on NVDA have paid over the last 12 months?"
+
+**Trade signals at another brokerage:**
+> "Switch my RSI bot to signals. I'll place the trades on Robinhood."
+>
+> "Any signals waiting? Place them on Robinhood and record the fills."
+
+## Signal mode: trade at any brokerage
+
+`place_order` and `close_position` only reach your VibeTrader Alpaca account. For
+money anywhere else, put a bot in signal mode. It keeps watching the market and
+deciding, but sends you each entry and exit instead of trading:
+
+1. `set_signal_mode(bot_id, follow_account="manual")` (pause the bot first)
+2. `list_open_signals()`: what to buy or sell, how much, and near what price
+3. Place the order with that brokerage's own tools. With Robinhood's MCP
+   connected in the same assistant, the assistant can do this step too.
+4. `report_signal(bot_id, decision_id, "bought", qty, price)` with the real fill,
+   so the bot tracks your actual shares and results and sends the exits.
+
+Signals also arrive by push, email or webhook, set up in the app.
 
 ## Development
 
@@ -190,3 +219,8 @@ gcloud run deploy vibetrader-mcp --source . --region us-central1
   `Authorization: Bearer vt_...` header is read from your own request and stored
   nowhere at all
 - Paper trading mode is default for safety
+- Every tool declares MCP annotations, so your client can run read-only tools
+  without asking and confirm the ones that trade, start bots or delete
+- `place_order` sends an order id derived from the order itself: retrying a
+  call (say, after a timeout) never places a second order. Pass
+  `idempotency_key` to control this explicitly

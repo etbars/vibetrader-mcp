@@ -51,16 +51,26 @@ STATE = {"bot_id": "b1", "entry_mode": "alert", "exit_mode": "alert", "follow_ac
 # --- set_signal_mode ------------------------------------------------------------
 
 def test_set_signal_mode_defaults_to_alerts_the_user_places_anywhere(monkeypatch):
-    calls, _ = _run(monkeypatch, server.set_signal_mode, bot_id="b1")
-    assert calls == [("POST", "/signals/bots/b1/mode",
-                      {"entry_mode": "alert", "exit_mode": "alert", "follow_account": "manual"})]
+    # A bot that isn't a signal bot yet has no account: "manual" is any brokerage.
+    calls, _ = _run(monkeypatch, server.set_signal_mode, {"/signals/bots/b1": {"follow_account": None}}, bot_id="b1")
+    assert calls[-1] == ("POST", "/signals/bots/b1/mode",
+                         {"entry_mode": "alert", "exit_mode": "alert", "follow_account": "manual"})
 
 
 def test_set_signal_mode_passes_capital_and_account(monkeypatch):
     calls, _ = _run(monkeypatch, server.set_signal_mode, bot_id="b1", entry_mode="alert", exit_mode="auto",
                     follow_account="alpaca_paper", signal_capital=5000)
-    assert calls[0][2] == {"entry_mode": "alert", "exit_mode": "auto", "follow_account": "alpaca_paper",
-                           "signal_capital": 5000}
+    assert calls == [("POST", "/signals/bots/b1/mode", {"entry_mode": "alert", "exit_mode": "auto",
+                                                         "follow_account": "alpaca_paper", "signal_capital": 5000})]
+
+
+def test_changing_one_side_keeps_the_account_and_capital(monkeypatch):
+    # The mode route replaces the whole setup: a field left out is written as
+    # missing. Changing one side must not repoint a bot that follows Alpaca.
+    state = {"follow_account": "alpaca_paper", "signal_capital": 5000.0}
+    calls, _ = _run(monkeypatch, server.set_signal_mode, {"/signals/bots/b1": state}, bot_id="b1", exit_mode="auto")
+    assert calls[-1][2] == {"entry_mode": "alert", "exit_mode": "auto", "follow_account": "alpaca_paper",
+                            "signal_capital": 5000.0}
 
 
 # --- list_open_signals ----------------------------------------------------------

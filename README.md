@@ -221,6 +221,7 @@ gcloud run deploy vibetrader-mcp --source . --region us-central1
 - Paper trading mode is default for safety
 - Every tool declares MCP annotations, so your client can run read-only tools
   without asking and confirm the ones that trade, start bots or delete
-- `place_order` sends an order id derived from the order itself: retrying a
-  call (say, after a timeout) never places a second order. Pass
-  `idempotency_key` to control this explicitly
+- `place_order` gives the same order the same order id while retries keep
+  coming within two minutes of the last try, so retrying a call (say, after a
+  timeout) never places a second order. Pass `idempotency_key` to hold the id
+  for as long as you like

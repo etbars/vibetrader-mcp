@@ -11,6 +11,7 @@ import asyncio
 import hashlib
 import logging
 import time
+import uuid
 from contextlib import asynccontextmanager
 from typing import Literal, Optional
 from datetime import datetime, timezone
@@ -75,6 +76,15 @@ class ApiError(ToolError):
         super().__init__(f"API Error ({status}): {detail}")
 
 
+class ApiUnreachable(ToolError):
+    """The API never answered (a timeout or a dropped connection). For a write,
+    that means it may or may not have happened."""
+
+    def __init__(self, detail: str):
+        self.detail = detail
+        super().__init__(f"No answer from the VibeTrader API ({detail}). Try again.")
+
+
 def _error_detail(response: httpx.Response) -> str:
     """The useful part of an error body, whatever its shape."""
     try:
@@ -101,9 +111,12 @@ class VibeTraderClient:
         }
 
     async def _request(self, method: str, endpoint: str, **kwargs) -> dict:
-        async with httpx.AsyncClient() as client:
-            url = f"{API_BASE_URL}{endpoint}"
-            response = await client.request(method, url, headers=self.headers, timeout=30.0, **kwargs)
+        try:
+            async with httpx.AsyncClient() as client:
+                url = f"{API_BASE_URL}{endpoint}"
+                response = await client.request(method, url, headers=self.headers, timeout=30.0, **kwargs)
+        except httpx.TransportError as e:
+            raise ApiUnreachable(type(e).__name__) from e
         if response.status_code >= 400:
             raise ApiError(response.status_code, _error_detail(response))
         return response.json() if response.content else {}
@@ -141,10 +154,12 @@ class VibeTraderClient:
 # get_http_headers() is request-scoped via contextvars, so each concurrent
 # task sees only its own request — that is what fixes the cross-user bleed.
 
-# session_id -> (validated vt_ key, when last used). Only used under HTTP
-# (multi-user). The MCP SDK closes a session idle for 30 minutes, so its key
-# goes with it: entries idle that long are dropped rather than kept forever.
-SESSION_TOKEN_IDLE_SECONDS = 30 * 60
+# session_id -> (validated vt_ key, when last used by a tool call). Only used
+# under HTTP (multi-user). Entries are dropped once unused this long, so the map
+# can't grow forever. It is far longer than the MCP SDK's own 30-minute session
+# timeout because pings keep a session alive without touching this map; a
+# session the SDK already closed can't be reached through it anyway.
+SESSION_TOKEN_IDLE_SECONDS = 12 * 60 * 60
 _tokens_by_session: dict[str, tuple[str, float]] = {}
 # Local stdio single-user fallback (no HTTP request context exists).
 _stdio_token: Optional[str] = None
@@ -902,12 +917,20 @@ async def close_position(symbol: str, mode: str = "paper", qty: float = None, pe
 
 
 # An agent that times out retries the call, and a retry with a fresh order id
-# is a second real order. place_order's id is a hash of the order itself, so
-# the API's order log answers a retry with 409 "already sent". Without an
-# idempotency_key the id holds for a two-minute window; the prefix is
-# vt_ticket_ because that's the only client id the order route keeps, and
-# "mcp" marks where the order came from.
+# is a second real order. So the same order gets the same client_order_id,
+# and the API's order log answers the repeat with 409 "already sent".
+#   - With an idempotency_key, the id is a hash of the order and the key: the
+#     same for as long as the caller reuses the key.
+#   - Without one, the id is remembered per caller and order, and reused while
+#     tries keep coming within ORDER_ID_WINDOW_SECONDS of the last one. Sliding,
+#     not fixed buckets: a bucket edge split a call from its retry (review
+#     2026-10-21). The memory is this process's; the service runs as one
+#     instance (--max-instances=1), and a restart forgets it.
+# The prefix is vt_ticket_ because that's the only client id the order route
+# keeps; "mcp" marks where the order came from.
 ORDER_ID_WINDOW_SECONDS = 120
+# fingerprint (caller, order, mode) -> (client_order_id, last try)
+_recent_order_ids: dict[str, tuple[str, float]] = {}
 
 
 def _wall_time() -> float:
@@ -915,13 +938,18 @@ def _wall_time() -> float:
 
 
 def _mcp_order_id(order: dict, mode: str, idempotency_key: Optional[str]) -> str:
-    seed = {"order": order, "mode": mode}
     if idempotency_key:
-        seed["key"] = idempotency_key
-    else:
-        seed["window"] = int(_wall_time() // ORDER_ID_WINDOW_SECONDS)
-    digest = hashlib.sha256(json.dumps(seed, sort_keys=True).encode()).hexdigest()[:32]
-    return f"vt_ticket_mcp_{digest}"
+        seed = json.dumps({"order": order, "mode": mode, "key": idempotency_key}, sort_keys=True)
+        return f"vt_ticket_mcp_{hashlib.sha256(seed.encode()).hexdigest()[:32]}"
+    now = _wall_time()
+    for stale in [k for k, (_, at) in _recent_order_ids.items() if now - at > ORDER_ID_WINDOW_SECONDS]:
+        del _recent_order_ids[stale]
+    caller = hashlib.sha256((_resolve_token() or "").encode()).hexdigest()
+    fingerprint = json.dumps({"caller": caller, "order": order, "mode": mode}, sort_keys=True)
+    remembered = _recent_order_ids.get(fingerprint)
+    cid = remembered[0] if remembered else f"vt_ticket_mcp_{uuid.uuid4().hex}"
+    _recent_order_ids[fingerprint] = (cid, now)
+    return cid
 
 
 @mcp.tool(annotations=CONSEQUENTIAL)
@@ -941,8 +969,8 @@ async def place_order(
     other brokerages the user linked (Robinhood, Webull, Fidelity, Coinbase
     and so on); if they ask for that, tell them it isn't supported here.
 
-    Retrying is safe: the same order sent again within two minutes, or with
-    the same idempotency_key, is never placed twice.
+    Retrying is safe: the same order sent again within two minutes of the
+    last try, or with the same idempotency_key, is never placed twice.
 
     Args:
         symbol: Stock/crypto symbol (e.g., "AAPL", "BTC/USD")
@@ -981,6 +1009,12 @@ async def place_order(
 
     try:
         result = await client.post(f"/trading/portfolio/order?mode={mode}&broker=alpaca", data)
+    except ApiUnreachable as e:
+        raise ToolError(
+            f"The order request got no answer ({e.detail}), so the order may or may not have been placed. "
+            "Retry the same call within two minutes (or with the same idempotency_key): a retry is never "
+            "placed twice. Or check get_trade_history first."
+        ) from e
     except ApiError as e:
         if e.status == 409 and "already sent" in e.detail:
             raise ToolError(
@@ -1215,7 +1249,7 @@ async def set_signal_mode(
     bot_id: str,
     entry_mode: Literal["alert", "auto"] = "alert",
     exit_mode: Literal["alert", "auto"] = "alert",
-    follow_account: str = "manual",
+    follow_account: Optional[str] = None,
     signal_capital: Optional[float] = None,
 ) -> str:
     """Switch a bot between placing its own trades and sending signals.
@@ -1234,22 +1268,34 @@ async def set_signal_mode(
         bot_id: The bot to switch
         entry_mode: "alert" (default) or "auto" for entries
         exit_mode: "alert" (default) or "auto" for exits
-        follow_account: Where the user places these trades. "manual" (default)
-            means any brokerage VibeTrader can't trade, such as Robinhood: the
-            user reports each fill with report_signal. Or a connected account:
+        follow_account: Where the user places these trades. "manual" means any
+            brokerage VibeTrader can't trade, such as Robinhood: the user
+            reports each fill with report_signal. Or a connected account:
             "alpaca_paper", "alpaca_live", or another connected brokerage
-            account's key.
+            account's key. Omit it to keep the bot's current account
+            ("manual" for a bot that isn't a signal bot yet).
         signal_capital: Dollars the user trades this bot with. Required with
             "manual" when the bot sizes by percent of portfolio or ATR risk,
-            so each signal can say how much to buy.
+            so each signal can say how much to buy. Omit it to keep the
+            bot's current amount.
     """
     for side, mode in (("entry_mode", entry_mode), ("exit_mode", exit_mode)):
         if mode not in ("alert", "auto"):
             raise ToolError(f"{side} must be 'alert' or 'auto'")
+    client = get_client()
+    if follow_account is None or signal_capital is None:
+        # The mode route replaces the whole setup, writing a field left out as
+        # missing: fill those from the bot's current setup, so changing one
+        # side never repoints a bot's account or drops its capital.
+        current = await client.get(f"/signals/bots/{_seg(bot_id)}")
+        if follow_account is None:
+            follow_account = current.get("follow_account") or "manual"
+        if signal_capital is None:
+            signal_capital = current.get("signal_capital")
     data = {"entry_mode": entry_mode, "exit_mode": exit_mode, "follow_account": follow_account}
     if signal_capital is not None:
         data["signal_capital"] = signal_capital
-    result = await get_client().post(f"/signals/bots/{_seg(bot_id)}/mode", data)
+    result = await client.post(f"/signals/bots/{_seg(bot_id)}/mode", data)
     return json.dumps(result, indent=2, default=str)
 
 

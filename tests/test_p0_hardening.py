@@ -154,6 +154,13 @@ def test_an_empty_success_body_is_an_empty_result(monkeypatch):
 
 # --- place_order can't double-fill on a retry ----------------------------------
 
+@pytest.fixture(autouse=True)
+def _fresh_order_memory():
+    server._recent_order_ids.clear()
+    yield
+    server._recent_order_ids.clear()
+
+
 def _order_cid(monkeypatch, at, **kwargs):
     client = _use(monkeypatch, _RecordingClient())
     monkeypatch.setattr(server, "_wall_time", lambda: at)
@@ -181,6 +188,40 @@ def test_an_idempotency_key_holds_the_id_past_the_window(monkeypatch):
     first = _order_cid(monkeypatch, 1_000_000.0, idempotency_key="rebalance-1")
     assert first == _order_cid(monkeypatch, 1_009_999.0, idempotency_key="rebalance-1")
     assert first != _order_cid(monkeypatch, 1_000_000.0, idempotency_key="rebalance-2")
+
+
+def test_a_retry_across_a_clock_boundary_reuses_its_id(monkeypatch):
+    # Review 2026-10-21: fixed two-minute buckets split a call at 1_000_079 and
+    # its retry at 1_000_085 into two ids, so both orders went through.
+    assert _order_cid(monkeypatch, 1_000_079.0) == _order_cid(monkeypatch, 1_000_085.0)
+
+
+def test_retries_keep_the_window_open(monkeypatch):
+    first = _order_cid(monkeypatch, 1_000_000.0)
+    assert _order_cid(monkeypatch, 1_000_110.0) == first
+    assert _order_cid(monkeypatch, 1_000_220.0) == first
+
+
+def test_the_same_order_after_a_quiet_window_is_a_new_order(monkeypatch):
+    first = _order_cid(monkeypatch, 1_000_000.0)
+    assert _order_cid(monkeypatch, 1_000_000.0 + server.ORDER_ID_WINDOW_SECONDS + 1) != first
+
+
+def test_a_timeout_says_the_order_may_have_been_placed(monkeypatch):
+    class _TimingOut(_RecordingClient):
+        async def post(self, endpoint, data=None):
+            raise server.ApiUnreachable("ReadTimeout")
+    _use(monkeypatch, _TimingOut())
+    with pytest.raises(ToolError, match="may or may not have been placed"):
+        asyncio.run(server.place_order.fn(symbol="AAPL", side="buy", qty=1))
+
+
+def test_an_unreachable_api_is_a_tool_error(monkeypatch):
+    def timeout(request):
+        raise httpx.ReadTimeout("timed out", request=request)
+    client = _client_answering(monkeypatch, timeout)
+    with pytest.raises(server.ApiUnreachable, match="No answer from the VibeTrader API"):
+        asyncio.run(client.get("/bots/"))
 
 
 def test_a_duplicate_order_says_how_to_place_another_on_purpose(monkeypatch):

@@ -23,6 +23,8 @@ from dotenv import load_dotenv
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from fastmcp.server.dependencies import get_http_headers
+
+from oauth_gate import OAuthGate, default_verifier
 from fastmcp.server.http import RequestContextMiddleware
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
@@ -1570,7 +1572,7 @@ async def _lifespan(app: Starlette):
             yield
 
 
-app = Starlette(
+_app = Starlette(
     routes=[
         # /mcp — streamable HTTP, exactly as before.
         *_streamable_app.routes,
@@ -1588,6 +1590,12 @@ app = Starlette(
     middleware=[Middleware(RequestContextMiddleware)],
     lifespan=_lifespan,
 )
+
+# Every request on /mcp, /sse and /messages/ needs a token VibeTrader's sign-in
+# issued for this server, or a vt_ key, as an Authorization header; anything
+# else gets the 401 that makes Claude and ChatGPT show "Connect". See
+# oauth_gate.py.
+app = OAuthGate(_app, default_verifier())
 
 if __name__ == "__main__":
     import sys

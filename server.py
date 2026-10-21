@@ -7,14 +7,18 @@ https://gofastmcp.com/deployment/http
 
 import os
 import json
+import hashlib
 import logging
+import time
 from contextlib import asynccontextmanager
 from typing import Optional
-from datetime import datetime
+from datetime import datetime, timezone
 
 import httpx
+import pytz
 from dotenv import load_dotenv
 from fastmcp import FastMCP
+from fastmcp.exceptions import ToolError
 from fastmcp.server.dependencies import get_http_headers
 from fastmcp.server.http import RequestContextMiddleware
 from starlette.applications import Starlette
@@ -34,13 +38,58 @@ API_BASE_URL = os.getenv("VIBETRADER_API_URL", "https://api.vibetrader.markets")
 # Initialize FastMCP
 mcp = FastMCP(
     "VibeTrader",
-    instructions="Create and manage AI-powered trading bots. Use 'authenticate' first with your API key from vibetrader.markets/settings"
+    instructions=(
+        "VibeTrader runs rule-based trading bots around the clock. Create a bot in plain English, "
+        "backtest it, and run it on paper, on the user's live Alpaca account, or as a signal bot that "
+        "tells the user what to trade at any brokerage. Hosted (HTTP) clients authenticate by sending "
+        "'Authorization: Bearer vt_...' with every request (the key is at vibetrader.markets/settings); "
+        "call 'authenticate' only from a client that can't send headers, or over local stdio. "
+        "place_order and close_position reach only the user's VibeTrader Alpaca account. For a "
+        "brokerage VibeTrader can't trade, such as Robinhood: put a bot in signal mode with "
+        "set_signal_mode(follow_account='manual'), read its signals with list_open_signals, place each "
+        "order with that brokerage's own tools, then record the fill with report_signal."
+    ),
 )
+
+# Tool annotations (MCP spec). Clients may run read-only tools without asking
+# and should confirm destructive ones. Here "destructive" means the call can
+# spend money, start trading or delete something.
+READ_ONLY = {"readOnlyHint": True}
+SAFE_WRITE = {"readOnlyHint": False, "destructiveHint": False}
+CONSEQUENTIAL = {"readOnlyHint": False, "destructiveHint": True}
 
 
 # =============================================================================
 # API Client
 # =============================================================================
+
+class ApiError(ToolError):
+    """The VibeTrader API answered with an error status. A ToolError, so the
+    agent sees a failed call (isError), never a result that reads like a win."""
+
+    def __init__(self, status: int, detail: str):
+        self.status = status
+        self.detail = detail
+        super().__init__(f"API Error ({status}): {detail}")
+
+
+def _error_detail(response: httpx.Response) -> str:
+    """The useful part of an error body, whatever its shape."""
+    try:
+        body = response.json()
+    except ValueError:
+        text = (response.text or "").strip()
+        # A proxy's HTML error page (Cloud Run's 502) says nothing an agent can use.
+        if not text or text.startswith("<"):
+            return response.reason_phrase or "Unknown error"
+        return text[:300]
+    detail = body.get("detail", body) if isinstance(body, dict) else body
+    if isinstance(detail, dict):          # the signal routes: {"code": ..., "message": ...}
+        return str(detail.get("message") or detail)
+    if isinstance(detail, list):          # FastAPI validation errors
+        return "; ".join(str(d.get("msg", d)) if isinstance(d, dict) else str(d) for d in detail)
+    return str(detail)
+
 
 class VibeTraderClient:
     def __init__(self, api_key: str):
@@ -48,15 +97,14 @@ class VibeTraderClient:
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json"
         }
-    
+
     async def _request(self, method: str, endpoint: str, **kwargs) -> dict:
         async with httpx.AsyncClient() as client:
             url = f"{API_BASE_URL}{endpoint}"
             response = await client.request(method, url, headers=self.headers, timeout=30.0, **kwargs)
-            if response.status_code >= 400:
-                error = response.json().get("detail", response.text) if response.text else "Unknown error"
-                raise Exception(f"API Error ({response.status_code}): {error}")
-            return response.json()
+        if response.status_code >= 400:
+            raise ApiError(response.status_code, _error_detail(response))
+        return response.json() if response.content else {}
     
     async def get(self, endpoint: str) -> dict:
         return await self._request("GET", endpoint)
@@ -91,10 +139,37 @@ class VibeTraderClient:
 # get_http_headers() is request-scoped via contextvars, so each concurrent
 # task sees only its own request — that is what fixes the cross-user bleed.
 
-# session_id -> validated vt_ key. Only used under HTTP (multi-user).
-_tokens_by_session: dict[str, str] = {}
+# session_id -> (validated vt_ key, when last used). Only used under HTTP
+# (multi-user). The MCP SDK closes a session idle for 30 minutes, so its key
+# goes with it: entries idle that long are dropped rather than kept forever.
+SESSION_TOKEN_IDLE_SECONDS = 30 * 60
+_tokens_by_session: dict[str, tuple[str, float]] = {}
 # Local stdio single-user fallback (no HTTP request context exists).
 _stdio_token: Optional[str] = None
+
+
+def _monotonic() -> float:
+    return time.monotonic()
+
+
+def _remember_session_token(sid: str, token: str) -> None:
+    now = _monotonic()
+    for stale in [s for s, (_, seen) in _tokens_by_session.items() if now - seen > SESSION_TOKEN_IDLE_SECONDS]:
+        del _tokens_by_session[stale]
+    _tokens_by_session[sid] = (token, now)
+
+
+def _session_token(sid: str) -> Optional[str]:
+    entry = _tokens_by_session.get(sid)
+    if entry is None:
+        return None
+    token, seen = entry
+    now = _monotonic()
+    if now - seen > SESSION_TOKEN_IDLE_SECONDS:
+        del _tokens_by_session[sid]
+        return None
+    _tokens_by_session[sid] = (token, now)
+    return token
 
 
 def _http_headers() -> dict:
@@ -147,8 +222,10 @@ def _resolve_token() -> Optional[str]:
         return token
     # 2. Per-session token set via the authenticate tool (HTTP, multi-user).
     sid = _session_id()
-    if sid and sid in _tokens_by_session:
-        return _tokens_by_session[sid]
+    if sid:
+        token = _session_token(sid)
+        if token:
+            return token
     # 3. Local stdio single-user fallback (no HTTP context).
     if not _is_http_context():
         return _stdio_token
@@ -158,9 +235,9 @@ def _resolve_token() -> Optional[str]:
 def get_client() -> VibeTraderClient:
     token = _resolve_token()
     if not token:
-        raise Exception(
-            "Not authenticated! Use the 'authenticate' tool with your API key, "
-            "or send it as an 'Authorization: Bearer vt_...' header."
+        raise ToolError(
+            "Not authenticated! Send your API key as an 'Authorization: Bearer vt_...' header, "
+            "or use the 'authenticate' tool if your client can't send headers."
         )
     return VibeTraderClient(token)
 
@@ -169,18 +246,18 @@ def get_client() -> VibeTraderClient:
 # Core Tools
 # =============================================================================
 
-@mcp.tool()
+@mcp.tool(annotations=SAFE_WRITE)
 async def authenticate(api_key: str) -> str:
     """Authenticate with your API key from vibetrader.markets/settings"""
     success, result = await validate_token(api_key)
     if not success:
-        return f"❌ Authentication failed: {result}"
+        raise ToolError(f"Authentication failed: {result}")
 
     # Store the validated key scoped to THIS caller only — never a shared
     # global (see the per-request auth section above for why).
     sid = _session_id()
     if sid:
-        _tokens_by_session[sid] = api_key
+        _remember_session_token(sid, api_key)
         return f"✅ Authenticated as {result}. You can now use all tools!"
     if not _is_http_context():
         # Local stdio: single user, safe to hold in-process.
@@ -196,12 +273,17 @@ async def authenticate(api_key: str) -> str:
     )
 
 
-@mcp.tool()
-async def list_bots(mode: Optional[str] = None) -> str:
+def _is_signal_bot(bot: dict) -> bool:
+    return "alert" in (bot.get("entry_mode"), bot.get("exit_mode"))
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def list_bots(mode: Optional[str] = None, limit: int = 100) -> str:
     """List all your trading bots.
-    
+
     Args:
         mode: Filter by trading mode - "paper", "live", or None for all bots
+        limit: Most bots to return (default 100)
     """
     client = get_client()
     bots = await client.get("/bots/")
@@ -209,20 +291,27 @@ async def list_bots(mode: Optional[str] = None) -> str:
         bots = [b for b in bots if b.get("trading_mode") == mode]
     if not bots:
         return json.dumps({"message": f"No {mode or ''} bots found", "bots": []})
-    summary = [{"id": b.get("id"), "name": b.get("name"), "status": b.get("status"), 
-                "trading_mode": b.get("trading_mode"), "total_pnl": round(b.get("total_pnl", 0), 2)} 
-               for b in bots[:10]]
-    return json.dumps({"total": len(bots), "bots": summary}, indent=2)
+    summary = []
+    for b in bots[:max(1, limit)]:
+        row = {"id": b.get("id"), "name": b.get("name"), "status": b.get("status"),
+               "trading_mode": b.get("trading_mode"), "total_pnl": round(b.get("total_pnl") or 0, 2)}
+        if _is_signal_bot(b):
+            row["signal_bot"] = True
+        summary.append(row)
+    out = {"total": len(bots), "bots": summary}
+    if len(summary) < len(bots):
+        out["note"] = f"Showing {len(summary)} of {len(bots)}. Raise limit, or use search_bots."
+    return json.dumps(out, indent=2)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 async def get_bot(bot_id: str) -> str:
     """Get details of a specific bot"""
     client = get_client()
     return json.dumps(await client.get(f"/bots/{bot_id}"), indent=2)
 
 
-@mcp.tool()
+@mcp.tool(annotations=SAFE_WRITE)
 async def create_bot(prompt: str, name: Optional[str] = None) -> str:
     """Create a new trading bot using natural language"""
     client = get_client()
@@ -233,7 +322,7 @@ async def create_bot(prompt: str, name: Optional[str] = None) -> str:
     return json.dumps({"status": "success", "bot": {"id": bot.get("id"), "name": bot.get("name")}}, indent=2)
 
 
-@mcp.tool()
+@mcp.tool(annotations=CONSEQUENTIAL)
 async def start_bot(bot_id: str) -> str:
     """Start a paused bot"""
     client = get_client()
@@ -241,7 +330,7 @@ async def start_bot(bot_id: str) -> str:
     return "✅ Bot started"
 
 
-@mcp.tool()
+@mcp.tool(annotations=SAFE_WRITE)
 async def pause_bot(bot_id: str) -> str:
     """Pause a running bot"""
     client = get_client()
@@ -249,7 +338,7 @@ async def pause_bot(bot_id: str) -> str:
     return "✅ Bot paused"
 
 
-@mcp.tool()
+@mcp.tool(annotations=CONSEQUENTIAL)
 async def delete_bot(bot_id: str) -> str:
     """Delete a bot"""
     client = get_client()
@@ -257,7 +346,7 @@ async def delete_bot(bot_id: str) -> str:
     return "✅ Bot deleted"
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 async def get_portfolio(mode: str = "paper") -> str:
     """Get portfolio positions and balance.
     
@@ -270,14 +359,14 @@ async def get_portfolio(mode: str = "paper") -> str:
     return json.dumps({"mode": mode, "account": account, "positions": positions}, indent=2)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 async def get_quote(symbol: str) -> str:
     """Get current quote for a stock"""
     client = get_client()
     return json.dumps(await client.get(f"/research/quote/{symbol}"), indent=2)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 async def list_indicators(family: str = "") -> str:
     """List every technical indicator VibeTrader bots can use, with each one's
     parameters (defaults and bounds) and outputs. Indicator math matches
@@ -303,10 +392,29 @@ async def list_indicators(family: str = "") -> str:
 # Bulk Actions
 # =============================================================================
 
-@mcp.tool()
+async def _for_each_bot(bots: list, act, done_verb: str, verb: str, mode: Optional[str]) -> str:
+    """Run `act` on every bot and say which ones failed, and why: a panic
+    button that reports "2 of 3" without naming the third is no use."""
+    label = f"{mode} bots" if mode else "bots"
+    failed = []
+    for bot in bots:
+        try:
+            await act(bot)
+        except Exception as e:
+            failed.append(f"'{bot.get('name') or bot.get('id')}' ({e})")
+    done = len(bots) - len(failed)
+    if failed and not done:
+        raise ToolError(f"Couldn't {verb} any of {len(bots)} {label}: " + "; ".join(failed))
+    message = f"✅ {done_verb} {done} of {len(bots)} {label}"
+    if failed:
+        message += f". Couldn't {verb}: " + "; ".join(failed)
+    return message
+
+
+@mcp.tool(annotations=SAFE_WRITE)
 async def pause_all_bots(mode: Optional[str] = None) -> str:
     """Pause all running bots at once.
-    
+
     Args:
         mode: Filter by trading mode - "paper", "live", or None for all bots
     """
@@ -315,25 +423,18 @@ async def pause_all_bots(mode: Optional[str] = None) -> str:
     running = [b for b in bots if b.get("status") == "running"]
     if mode:
         running = [b for b in running if b.get("trading_mode") == mode]
-    
+
     if not running:
         return f"No running {mode or ''} bots to pause"
-    
-    paused = 0
-    for bot in running:
-        try:
-            await client.post(f"/bots/{bot['id']}/pause")
-            paused += 1
-        except:
-            pass
-    
-    return f"✅ Paused {paused} of {len(running)} {mode or ''} bots"
+
+    return await _for_each_bot(running, lambda b: client.post(f"/bots/{b['id']}/pause"),
+                               "Paused", "pause", mode)
 
 
-@mcp.tool()
+@mcp.tool(annotations=CONSEQUENTIAL)
 async def start_all_bots(mode: Optional[str] = None) -> str:
     """Start all paused bots at once.
-    
+
     Args:
         mode: Filter by trading mode - "paper", "live", or None for all bots
     """
@@ -342,56 +443,42 @@ async def start_all_bots(mode: Optional[str] = None) -> str:
     paused = [b for b in bots if b.get("status") == "paused"]
     if mode:
         paused = [b for b in paused if b.get("trading_mode") == mode]
-    
+
     if not paused:
         return f"No paused {mode or ''} bots to start"
-    
-    started = 0
-    for bot in paused:
-        try:
-            await client.post(f"/bots/{bot['id']}/start")
-            started += 1
-        except:
-            pass
-    
-    return f"✅ Started {started} of {len(paused)} {mode or ''} bots"
+
+    return await _for_each_bot(paused, lambda b: client.post(f"/bots/{b['id']}/start"),
+                               "Started", "start", mode)
 
 
-@mcp.tool()
+@mcp.tool(annotations=CONSEQUENTIAL)
 async def delete_all_bots(confirm: str, mode: Optional[str] = None) -> str:
     """Delete ALL bots. Requires confirm='DELETE ALL' to proceed.
-    
+
     Args:
         confirm: Must be 'DELETE ALL' to confirm deletion
         mode: Filter by trading mode - "paper", "live", or None for all bots
     """
     if confirm != "DELETE ALL":
-        return "❌ To delete all bots, pass confirm='DELETE ALL'"
-    
+        raise ToolError("To delete all bots, pass confirm='DELETE ALL'")
+
     client = get_client()
     bots = await client.get("/bots/")
     if mode:
         bots = [b for b in bots if b.get("trading_mode") == mode]
-    
+
     if not bots:
         return f"No {mode or ''} bots to delete"
-    
-    deleted = 0
-    for bot in bots:
-        try:
-            await client.delete(f"/bots/{bot['id']}")
-            deleted += 1
-        except:
-            pass
-    
-    return f"✅ Deleted {deleted} of {len(bots)} {mode or ''} bots"
+
+    return await _for_each_bot(bots, lambda b: client.delete(f"/bots/{b['id']}"),
+                               "Deleted", "delete", mode)
 
 
 # =============================================================================
 # Utility Tools
 # =============================================================================
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 async def get_bot_stats(mode: Optional[str] = None) -> str:
     """Get aggregate statistics across your bots.
     
@@ -424,24 +511,41 @@ async def get_bot_stats(mode: Optional[str] = None) -> str:
     return json.dumps(stats, indent=2)
 
 
-@mcp.tool()
+_EASTERN = pytz.timezone("America/New_York")
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+@mcp.tool(annotations=READ_ONLY)
 async def get_market_status() -> str:
-    """Check if US stock markets are currently open"""
-    now = datetime.utcnow()
-    # Convert to ET (UTC-5 or UTC-4 depending on DST)
-    et_hour = (now.hour - 5) % 24
-    
-    is_weekday = now.weekday() < 5
-    is_market_hours = (et_hour > 9 or (et_hour == 9 and now.minute >= 30)) and et_hour < 16
-    
+    """Check whether the US stock market is open now, with its next open and
+    close. Reads the exchange clock (holidays and early closes included)."""
+    try:
+        clock = await get_client().get("/research/market/status")
+    except Exception:
+        clock = None
+    if isinstance(clock, dict) and "isOpen" in clock:
+        return json.dumps({
+            "is_open": bool(clock.get("isOpen")),
+            "next_open": clock.get("nextOpen"),
+            "next_close": clock.get("nextClose"),
+            "as_of": clock.get("timestamp"),
+        }, indent=2)
+
+    # No key, or the clock is unreachable: regular hours in real Eastern time.
+    now_et = _utc_now().astimezone(_EASTERN)
+    minute = now_et.hour * 60 + now_et.minute
     return json.dumps({
-        "is_open": is_weekday and is_market_hours,
-        "current_time_utc": now.strftime("%Y-%m-%d %H:%M:%S UTC"),
-        "note": "Markets open 9:30 AM - 4:00 PM ET, Monday-Friday"
+        "is_open": now_et.weekday() < 5 and 9 * 60 + 30 <= minute < 16 * 60,
+        "current_time_et": now_et.strftime("%Y-%m-%d %H:%M %Z"),
+        "note": ("Regular hours only (9:30 AM-4:00 PM ET, Monday-Friday): this doesn't know market "
+                 "holidays or early closes. Authenticate to read the exchange clock."),
     }, indent=2)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 async def get_account_summary(mode: str = "paper") -> str:
     """Get account balance, buying power, and key metrics.
     
@@ -460,7 +564,7 @@ async def get_account_summary(mode: str = "paper") -> str:
     }, indent=2)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 async def search_bots(query: str) -> str:
     """Search for bots by name"""
     client = get_client()
@@ -479,7 +583,7 @@ async def search_bots(query: str) -> str:
 # Trade History Tools
 # =============================================================================
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 async def get_trade_history(mode: str = "paper", limit: int = 20) -> str:
     """Get recent trade history across all bots.
     
@@ -514,7 +618,7 @@ async def get_trade_history(mode: str = "paper", limit: int = 20) -> str:
     }, indent=2)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 async def get_bot_trades(bot_id: str, limit: int = 20) -> str:
     """Get trade history for a specific bot.
     
@@ -560,7 +664,7 @@ async def get_bot_trades(bot_id: str, limit: int = 20) -> str:
     }, indent=2)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 async def get_daily_trade_stats(bot_id: str, days: int = 30) -> str:
     """Get daily trading statistics for a bot.
     
@@ -601,182 +705,163 @@ async def get_daily_trade_stats(bot_id: str, days: int = 30) -> str:
 # Strategy Tools
 # =============================================================================
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 async def get_bot_strategy(bot_id: str) -> str:
     """Get the full strategy configuration for a bot.
-    
+
     Returns entry rules, exit rules, indicators, risk settings, and symbols.
-    
+
     Args:
         bot_id: The bot ID to get strategy for
     """
     client = get_client()
-    
-    try:
-        strategy = await client.get(f"/strategy/bots/{bot_id}/strategy")
-        
-        # Extract key info from strategy_json
-        strat_json = strategy.get("strategy_json", {})
-        
-        return json.dumps({
-            "bot_id": bot_id,
-            "version": strategy.get("version", 1),
-            "strategy": {
-                "symbols": strat_json.get("symbols", []),
-                "entry_rules": strat_json.get("entry_rules", []),
-                "exit_rules": strat_json.get("exit_rules", []),
-                "indicators": strat_json.get("indicators", []),
-                "position_sizing": strat_json.get("position_sizing", {}),
-                "risk_management": strat_json.get("risk_management", {}),
-                "strategy_type": strat_json.get("strategy_type", "standard"),
-            },
-            "generated_code": strategy.get("generated_code", ""),
-            "created_at": strategy.get("created_at"),
-        }, indent=2)
-    except Exception as e:
-        return json.dumps({"error": str(e)})
+    strategy = await client.get(f"/strategy/bots/{bot_id}/strategy")
+
+    # Extract key info from strategy_json
+    strat_json = strategy.get("strategy_json", {})
+
+    return json.dumps({
+        "bot_id": bot_id,
+        "version": strategy.get("version", 1),
+        "strategy": {
+            "symbols": strat_json.get("symbols", []),
+            "entry_rules": strat_json.get("entry_rules", []),
+            "exit_rules": strat_json.get("exit_rules", []),
+            "indicators": strat_json.get("indicators", []),
+            "position_sizing": strat_json.get("position_sizing", {}),
+            "risk_management": strat_json.get("risk_management", {}),
+            "strategy_type": strat_json.get("strategy_type", "standard"),
+        },
+        "generated_code": strategy.get("generated_code", ""),
+        "created_at": strategy.get("created_at"),
+    }, indent=2)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 async def explain_bot_strategy(bot_id: str) -> str:
     """Get a plain English explanation of a bot's strategy.
-    
+
     Explains entry rules, exit rules, and risk settings in simple terms.
-    
+
     Args:
         bot_id: The bot ID to explain
     """
     client = get_client()
-    
-    try:
-        explanation = await client.get(f"/strategy/bots/{bot_id}/strategy/explain")
-        return json.dumps({
-            "bot_id": bot_id,
-            "explanation": explanation.get("explanation", ""),
-            "entry_rules": explanation.get("entry_rules", ""),
-            "exit_rules": explanation.get("exit_rules", ""),
-            "risk_settings": explanation.get("risk_settings", "")
-        }, indent=2)
-    except Exception as e:
-        return json.dumps({"error": str(e)})
+    explanation = await client.get(f"/strategy/bots/{bot_id}/strategy/explain")
+    return json.dumps({
+        "bot_id": bot_id,
+        "explanation": explanation.get("explanation", ""),
+        "entry_rules": explanation.get("entry_rules", ""),
+        "exit_rules": explanation.get("exit_rules", ""),
+        "risk_settings": explanation.get("risk_settings", "")
+    }, indent=2)
 
 
-@mcp.tool()
+@mcp.tool(annotations=SAFE_WRITE)
 async def refine_bot(bot_id: str, prompt: str) -> str:
     """Refine a bot's strategy using natural language.
-    
+
     Describe changes you want to make to the strategy. The bot will be paused
     during refinement and a new strategy version will be created.
-    
+
     Args:
         bot_id: The bot ID to refine
         prompt: Natural language description of changes (e.g., "add a trailing stop of 5%")
     """
     client = get_client()
-    
-    try:
-        bot = await client.post(f"/bots/{bot_id}/refine", {"prompt": prompt})
-        return json.dumps({
-            "success": True,
-            "message": f"Strategy refined for '{bot.get('name')}'",
-            "bot": {
-                "id": bot.get("id"),
-                "name": bot.get("name"),
-                "status": bot.get("status"),
-                "strategy_version": bot.get("strategy_version")
-            }
-        }, indent=2)
-    except Exception as e:
-        return json.dumps({"success": False, "error": str(e)})
+    bot = await client.post(f"/bots/{bot_id}/refine", {"prompt": prompt})
+    return json.dumps({
+        "success": True,
+        "message": f"Strategy refined for '{bot.get('name')}'",
+        "bot": {
+            "id": bot.get("id"),
+            "name": bot.get("name"),
+            "status": bot.get("status"),
+            "strategy_version": bot.get("strategy_version")
+        }
+    }, indent=2)
 
 
-@mcp.tool()
+@mcp.tool(annotations=CONSEQUENTIAL)
 async def update_bot(bot_id: str, name: str = None, status: str = None) -> str:
     """Update a bot's name or status.
-    
+
     Args:
         bot_id: The bot ID to update
         name: New name for the bot (optional)
         status: New status - "running" or "paused" (optional)
     """
     client = get_client()
-    
+
     data = {}
     if name:
         data["name"] = name
     if status:
         data["status"] = status
-    
+
     if not data:
-        return json.dumps({"error": "Provide at least one field to update (name or status)"})
-    
-    try:
-        bot = await client.patch(f"/bots/{bot_id}", data)
-        return json.dumps({
-            "success": True,
-            "bot": {
-                "id": bot.get("id"),
-                "name": bot.get("name"),
-                "status": bot.get("status")
-            }
-        }, indent=2)
-    except Exception as e:
-        return json.dumps({"success": False, "error": str(e)})
+        raise ToolError("Provide at least one field to update (name or status)")
+
+    bot = await client.patch(f"/bots/{bot_id}", data)
+    return json.dumps({
+        "success": True,
+        "bot": {
+            "id": bot.get("id"),
+            "name": bot.get("name"),
+            "status": bot.get("status")
+        }
+    }, indent=2)
 
 
 # =============================================================================
 # Trading Tools
 # =============================================================================
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 async def get_positions(mode: str = "paper") -> str:
     """Get current open positions with unrealized P&L.
-    
+
     Args:
         mode: Account mode - "paper" (default) or "live" for real money
     """
     client = get_client()
-    
-    try:
-        positions = await client.get(f"/trading/portfolio/alpaca-positions?mode={mode}")
-        
-        if not positions:
-            return json.dumps({"message": f"No open {mode} positions", "positions": []})
-        
-        # Format positions for readability
-        formatted = []
-        total_value = 0
-        total_pnl = 0
-        
-        for p in positions:
-            market_value = float(p.get("market_value", 0))
-            unrealized_pl = float(p.get("unrealized_pl", 0))
-            total_value += market_value
-            total_pnl += unrealized_pl
-            
-            formatted.append({
-                "symbol": p.get("symbol"),
-                "qty": float(p.get("qty", 0)),
-                "avg_entry_price": float(p.get("avg_entry_price", 0)),
-                "current_price": float(p.get("current_price", 0)),
-                "market_value": round(market_value, 2),
-                "unrealized_pnl": round(unrealized_pl, 2),
-                "unrealized_pnl_percent": round(float(p.get("unrealized_plpc", 0)) * 100, 2),
-                "side": p.get("side", "long")
-            })
-        
-        return json.dumps({
-            "mode": mode,
-            "total_positions": len(formatted),
-            "total_market_value": round(total_value, 2),
-            "total_unrealized_pnl": round(total_pnl, 2),
-            "positions": formatted
-        }, indent=2)
-    except Exception as e:
-        return json.dumps({"error": str(e)})
+    positions = await client.get(f"/trading/portfolio/alpaca-positions?mode={mode}")
+
+    if not positions:
+        return json.dumps({"message": f"No open {mode} positions", "positions": []})
+
+    # Format positions for readability
+    formatted = []
+    total_value = 0
+    total_pnl = 0
+
+    for p in positions:
+        market_value = float(p.get("market_value", 0))
+        unrealized_pl = float(p.get("unrealized_pl", 0))
+        total_value += market_value
+        total_pnl += unrealized_pl
+
+        formatted.append({
+            "symbol": p.get("symbol"),
+            "qty": float(p.get("qty", 0)),
+            "avg_entry_price": float(p.get("avg_entry_price", 0)),
+            "current_price": float(p.get("current_price", 0)),
+            "market_value": round(market_value, 2),
+            "unrealized_pnl": round(unrealized_pl, 2),
+            "unrealized_pnl_percent": round(float(p.get("unrealized_plpc", 0)) * 100, 2),
+            "side": p.get("side", "long")
+        })
+
+    return json.dumps({
+        "mode": mode,
+        "total_positions": len(formatted),
+        "total_market_value": round(total_value, 2),
+        "total_unrealized_pnl": round(total_pnl, 2),
+        "positions": formatted
+    }, indent=2)
 
 
-@mcp.tool()
+@mcp.tool(annotations=CONSEQUENTIAL)
 async def close_position(symbol: str, mode: str = "paper", qty: float = None, percentage: float = None) -> str:
     """Close a position by symbol in the user's VibeTrader Alpaca account.
 
@@ -793,31 +878,51 @@ async def close_position(symbol: str, mode: str = "paper", qty: float = None, pe
         percentage: Percentage of position to close, 0-100 (optional)
     """
     client = get_client()
-    
-    try:
-        data = {}
-        if qty is not None:
-            data["qty"] = qty
-        if percentage is not None:
-            data["percentage"] = percentage
-        
-        # broker is explicit: the API falls back to "alpaca" when it is
-        # missing, and an implicit default is how the wrong account got sold.
-        result = await client.post(
-            f"/trading/portfolio/close/{symbol}?mode={mode}&broker=alpaca",
-            data if data else None,
-        )
-        
-        return json.dumps({
-            "success": True,
-            "message": f"Position {symbol} closed",
-            "details": result
-        }, indent=2)
-    except Exception as e:
-        return json.dumps({"success": False, "error": str(e)})
+
+    data = {}
+    if qty is not None:
+        data["qty"] = qty
+    if percentage is not None:
+        data["percentage"] = percentage
+
+    # broker is explicit: the API falls back to "alpaca" when it is
+    # missing, and an implicit default is how the wrong account got sold.
+    result = await client.post(
+        f"/trading/portfolio/close/{symbol}?mode={mode}&broker=alpaca",
+        data if data else None,
+    )
+
+    return json.dumps({
+        "success": True,
+        "message": f"Position {symbol} closed",
+        "details": result
+    }, indent=2)
 
 
-@mcp.tool()
+# An agent that times out retries the call, and a retry with a fresh order id
+# is a second real order. place_order's id is a hash of the order itself, so
+# the API's order log answers a retry with 409 "already sent". Without an
+# idempotency_key the id holds for a two-minute window; the prefix is
+# vt_ticket_ because that's the only client id the order route keeps, and
+# "mcp" marks where the order came from.
+ORDER_ID_WINDOW_SECONDS = 120
+
+
+def _wall_time() -> float:
+    return time.time()
+
+
+def _mcp_order_id(order: dict, mode: str, idempotency_key: Optional[str]) -> str:
+    seed = {"order": order, "mode": mode}
+    if idempotency_key:
+        seed["key"] = idempotency_key
+    else:
+        seed["window"] = int(_wall_time() // ORDER_ID_WINDOW_SECONDS)
+    digest = hashlib.sha256(json.dumps(seed, sort_keys=True).encode()).hexdigest()[:32]
+    return f"vt_ticket_mcp_{digest}"
+
+
+@mcp.tool(annotations=CONSEQUENTIAL)
 async def place_order(
     symbol: str,
     side: str,
@@ -825,13 +930,17 @@ async def place_order(
     notional: float = None,
     order_type: str = "market",
     limit_price: float = None,
-    mode: str = "paper"
+    mode: str = "paper",
+    idempotency_key: Optional[str] = None,
 ) -> str:
     """Place a buy or sell order in the user's VibeTrader Alpaca account.
 
     This only reaches the Alpaca account (paper or live). It cannot trade at
     other brokerages the user linked (Robinhood, Webull, Fidelity, Coinbase
     and so on); if they ask for that, tell them it isn't supported here.
+
+    Retrying is safe: the same order sent again within two minutes, or with
+    the same idempotency_key, is never placed twice.
 
     Args:
         symbol: Stock/crypto symbol (e.g., "AAPL", "BTC/USD")
@@ -841,46 +950,56 @@ async def place_order(
         order_type: "market" (default) or "limit"
         limit_price: Required for limit orders
         mode: Account mode - "paper" (default) or "live"
+        idempotency_key: Optional. Any string naming this one order. Pass the
+            same key when retrying it; pass a new key to place a second
+            identical order on purpose.
     """
     client = get_client()
-    
+
     if not qty and not notional:
-        return json.dumps({"error": "Either qty or notional (dollar amount) required"})
-    
+        raise ToolError("Either qty or notional (dollar amount) required")
+
     if order_type == "limit" and not limit_price:
-        return json.dumps({"error": "limit_price required for limit orders"})
-    
+        raise ToolError("limit_price required for limit orders")
+
+    data = {
+        "symbol": symbol.upper(),
+        "side": side.lower(),
+        "order_type": order_type,
+        "time_in_force": "day"
+    }
+
+    if qty:
+        data["qty"] = qty
+    if notional:
+        data["notional"] = notional
+    if limit_price:
+        data["limit_price"] = limit_price
+    data["client_order_id"] = _mcp_order_id(dict(data), mode, idempotency_key)
+
     try:
-        data = {
-            "symbol": symbol.upper(),
-            "side": side.lower(),
-            "order_type": order_type,
-            "time_in_force": "day"
-        }
-        
-        if qty:
-            data["qty"] = qty
-        if notional:
-            data["notional"] = notional
-        if limit_price:
-            data["limit_price"] = limit_price
-        
         result = await client.post(f"/trading/portfolio/order?mode={mode}&broker=alpaca", data)
-        
-        return json.dumps({
-            "success": True,
-            "message": f"{side.upper()} order placed for {symbol}",
-            "order": result
-        }, indent=2)
-    except Exception as e:
-        return json.dumps({"success": False, "error": str(e)})
+    except ApiError as e:
+        if e.status == 409 and "already sent" in e.detail:
+            raise ToolError(
+                "This order was already placed (the same order in the last two minutes, or one with this "
+                "idempotency_key), so it wasn't sent again. Check get_trade_history or get_positions. "
+                "To place a second identical order on purpose, call place_order with a new idempotency_key."
+            ) from e
+        raise
+
+    return json.dumps({
+        "success": True,
+        "message": f"{side.upper()} order placed for {symbol}",
+        "order": result
+    }, indent=2)
 
 
 # =============================================================================
 # Backtest Tools
 # =============================================================================
 
-@mcp.tool()
+@mcp.tool(annotations=SAFE_WRITE)
 async def run_backtest(
     bot_id: str,
     start_date: str = None,
@@ -889,170 +1008,158 @@ async def run_backtest(
 ) -> str:
     """
     Run a historical backtest for a bot's current strategy.
-    
+
     Simulates how the strategy would have performed on historical data.
     Returns ROI, max drawdown, win rate, trade count, and equity curve.
-    
+
     Args:
         bot_id: The bot ID to backtest
         start_date: Start date (YYYY-MM-DD). Default: 30 days ago
         end_date: End date (YYYY-MM-DD). Default: today
         initial_capital: Starting capital for simulation (default: $10,000)
-    
+
     Note: Max 30-day lookback for standard bots. Covered call bots support up to 3 years.
     """
-    try:
-        client = get_client()
-        
-        data = {"initial_capital": initial_capital}
-        if start_date:
-            data["start_date"] = start_date
-        if end_date:
-            data["end_date"] = end_date
-        
-        result = await client.post(f"/backtest/bots/{bot_id}/backtest", data)
-        
-        # Format key metrics
-        summary = {
-            "success": True,
-            "bot_id": bot_id,
-            "period": f"{result.get('start_date')} to {result.get('end_date')}",
-            "initial_capital": result.get("initial_capital"),
-            "final_value": round(result.get("final_value", 0), 2),
-            "total_return_pct": round(result.get("total_return", 0), 2),
-            "total_pnl": round(result.get("total_pnl", 0), 2),
-            "max_drawdown_pct": round(result.get("max_drawdown_percent", 0), 2),
-            "total_trades": result.get("total_trades", 0),
-            "win_rate_pct": round(result.get("win_rate", 0), 2),
-            "avg_trade_pnl": round(result.get("avg_trade_pnl", 0), 2),
-            "best_trade": round(result.get("best_trade", 0), 2),
-            "worst_trade": round(result.get("worst_trade", 0), 2),
-            "backtest_id": result.get("id")
-        }
-        
-        return json.dumps(summary, indent=2)
-    except Exception as e:
-        return json.dumps({"success": False, "error": str(e)})
+    client = get_client()
+
+    data = {"initial_capital": initial_capital}
+    if start_date:
+        data["start_date"] = start_date
+    if end_date:
+        data["end_date"] = end_date
+
+    result = await client.post(f"/backtest/bots/{bot_id}/backtest", data)
+
+    # Format key metrics
+    summary = {
+        "success": True,
+        "bot_id": bot_id,
+        "period": f"{result.get('start_date')} to {result.get('end_date')}",
+        "initial_capital": result.get("initial_capital"),
+        "final_value": round(result.get("final_value", 0), 2),
+        "total_return_pct": round(result.get("total_return", 0), 2),
+        "total_pnl": round(result.get("total_pnl", 0), 2),
+        "max_drawdown_pct": round(result.get("max_drawdown_percent", 0), 2),
+        "total_trades": result.get("total_trades", 0),
+        "win_rate_pct": round(result.get("win_rate", 0), 2),
+        "avg_trade_pnl": round(result.get("avg_trade_pnl", 0), 2),
+        "best_trade": round(result.get("best_trade", 0), 2),
+        "worst_trade": round(result.get("worst_trade", 0), 2),
+        "backtest_id": result.get("id")
+    }
+
+    return json.dumps(summary, indent=2)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 async def list_backtests(bot_id: str) -> str:
     """
     List all backtests for a bot.
-    
+
     Args:
         bot_id: The bot ID to list backtests for
-    
+
     Returns summary of each backtest including date range, return, and win rate.
     """
-    try:
-        client = get_client()
-        backtests = await client.get(f"/backtest/bots/{bot_id}/backtests")
-        
-        if not backtests:
-            return json.dumps({"message": "No backtests found for this bot", "backtests": []})
-        
-        formatted = []
-        for bt in backtests:
-            formatted.append({
-                "id": bt.get("id"),
-                "period": f"{bt.get('start_date')} to {bt.get('end_date')}",
-                "return_pct": round(bt.get("total_return", 0), 2),
-                "trades": bt.get("total_trades", 0),
-                "win_rate_pct": round(bt.get("win_rate", 0), 2),
-                "max_drawdown_pct": round(bt.get("max_drawdown_percent", 0), 2)
-            })
-        
-        return json.dumps({
-            "bot_id": bot_id,
-            "total_backtests": len(formatted),
-            "backtests": formatted
-        }, indent=2)
-    except Exception as e:
-        return json.dumps({"success": False, "error": str(e)})
+    client = get_client()
+    backtests = await client.get(f"/backtest/bots/{bot_id}/backtests")
+
+    if not backtests:
+        return json.dumps({"message": "No backtests found for this bot", "backtests": []})
+
+    formatted = []
+    for bt in backtests:
+        formatted.append({
+            "id": bt.get("id"),
+            "period": f"{bt.get('start_date')} to {bt.get('end_date')}",
+            "return_pct": round(bt.get("total_return", 0), 2),
+            "trades": bt.get("total_trades", 0),
+            "win_rate_pct": round(bt.get("win_rate", 0), 2),
+            "max_drawdown_pct": round(bt.get("max_drawdown_percent", 0), 2)
+        })
+
+    return json.dumps({
+        "bot_id": bot_id,
+        "total_backtests": len(formatted),
+        "backtests": formatted
+    }, indent=2)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 async def get_backtest(bot_id: str, backtest_id: str) -> str:
     """
     Get detailed results for a specific backtest.
-    
+
     Args:
         bot_id: The bot ID
         backtest_id: The backtest ID to retrieve
-    
+
     Returns full backtest details including trades and equity curve.
     """
-    try:
-        client = get_client()
-        result = await client.get(f"/backtest/bots/{bot_id}/backtests/{backtest_id}")
-        
-        return json.dumps({
-            "success": True,
-            "backtest_id": result.get("id"),
-            "bot_id": bot_id,
-            "period": f"{result.get('start_date')} to {result.get('end_date')}",
-            "initial_capital": result.get("initial_capital"),
-            "final_value": round(result.get("final_value", 0), 2),
-            "total_return_pct": round(result.get("total_return", 0), 2),
-            "total_pnl": round(result.get("total_pnl", 0), 2),
-            "max_drawdown_pct": round(result.get("max_drawdown_percent", 0), 2),
-            "total_trades": result.get("total_trades", 0),
-            "winning_trades": result.get("winning_trades", 0),
-            "losing_trades": result.get("losing_trades", 0),
-            "win_rate_pct": round(result.get("win_rate", 0), 2),
-            "avg_trade_pnl": round(result.get("avg_trade_pnl", 0), 2),
-            "avg_win": round(result.get("avg_win", 0), 2),
-            "avg_loss": round(result.get("avg_loss", 0), 2),
-            "best_trade": round(result.get("best_trade", 0), 2),
-            "worst_trade": round(result.get("worst_trade", 0), 2),
-            "trade_count": len(result.get("trades", [])),
-            "equity_curve_points": len(result.get("equity_curve", []))
-        }, indent=2)
-    except Exception as e:
-        return json.dumps({"success": False, "error": str(e)})
+    client = get_client()
+    result = await client.get(f"/backtest/bots/{bot_id}/backtests/{backtest_id}")
+
+    return json.dumps({
+        "success": True,
+        "backtest_id": result.get("id"),
+        "bot_id": bot_id,
+        "period": f"{result.get('start_date')} to {result.get('end_date')}",
+        "initial_capital": result.get("initial_capital"),
+        "final_value": round(result.get("final_value", 0), 2),
+        "total_return_pct": round(result.get("total_return", 0), 2),
+        "total_pnl": round(result.get("total_pnl", 0), 2),
+        "max_drawdown_pct": round(result.get("max_drawdown_percent", 0), 2),
+        "total_trades": result.get("total_trades", 0),
+        "winning_trades": result.get("winning_trades", 0),
+        "losing_trades": result.get("losing_trades", 0),
+        "win_rate_pct": round(result.get("win_rate", 0), 2),
+        "avg_trade_pnl": round(result.get("avg_trade_pnl", 0), 2),
+        "avg_win": round(result.get("avg_win", 0), 2),
+        "avg_loss": round(result.get("avg_loss", 0), 2),
+        "best_trade": round(result.get("best_trade", 0), 2),
+        "worst_trade": round(result.get("worst_trade", 0), 2),
+        "trade_count": len(result.get("trades", [])),
+        "equity_curve_points": len(result.get("equity_curve", []))
+    }, indent=2)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 async def quick_covered_call_backtest(
     symbol: str = "NVDA",
     months: int = 12
 ) -> str:
     """
     Run a quick covered call income strategy backtest.
-    
+
     Simulates the covered call strategy:
     1. Buy 100 shares of the underlying
     2. Sell monthly covered calls (~30 DTE, 5% OTM)
     3. Collect premium and track assignments
-    
+
     Args:
         symbol: Stock symbol (default: NVDA)
         months: Number of months to backtest (3-36, default: 12)
-    
+
     Returns estimated monthly income, annual yield, and assignment frequency.
     """
-    try:
-        client = get_client()
-        result = await client.get(f"/backtest/covered-call/quick?symbol={symbol}&months={months}")
-        
-        if not result.get("success"):
-            return json.dumps({"success": False, "error": result.get("error", "Backtest failed")})
-        
-        return json.dumps({
-            "success": True,
-            "symbol": result.get("symbol"),
-            "period_months": result.get("period_months"),
-            "total_return_pct": round(result.get("total_return_pct", 0), 2),
-            "total_premium_collected": round(result.get("total_premium", 0), 2),
-            "avg_monthly_income": round(result.get("avg_monthly_income", 0), 2),
-            "estimated_annual_yield_pct": round(result.get("annual_yield_pct", 0), 2),
-            "max_drawdown_pct": round(result.get("max_drawdown_pct", 0), 2),
-            "total_assignments": result.get("assignments", 0),
-            "calls_sold": result.get("calls_sold", 0)
-        }, indent=2)
-    except Exception as e:
-        return json.dumps({"success": False, "error": str(e)})
+    client = get_client()
+    result = await client.get(f"/backtest/covered-call/quick?symbol={symbol}&months={months}")
+
+    if not result.get("success"):
+        raise ToolError(result.get("error") or "Backtest failed")
+
+    return json.dumps({
+        "success": True,
+        "symbol": result.get("symbol"),
+        "period_months": result.get("period_months"),
+        "total_return_pct": round(result.get("total_return_pct", 0), 2),
+        "total_premium_collected": round(result.get("total_premium", 0), 2),
+        "avg_monthly_income": round(result.get("avg_monthly_income", 0), 2),
+        "estimated_annual_yield_pct": round(result.get("annual_yield_pct", 0), 2),
+        "max_drawdown_pct": round(result.get("max_drawdown_pct", 0), 2),
+        "total_assignments": result.get("assignments", 0),
+        "calls_sold": result.get("calls_sold", 0)
+    }, indent=2)
 
 
 # =============================================================================

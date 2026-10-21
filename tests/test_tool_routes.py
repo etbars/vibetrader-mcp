@@ -17,7 +17,11 @@ class _RecordingClient:
 
     async def get(self, endpoint):
         self.calls.append(("GET", endpoint))
-        return []
+        # The shape each route answers: a list for a collection, an object
+        # otherwise. (A failure is now a tool error, not swallowed into JSON.)
+        if endpoint.endswith("/backtests"):
+            return []
+        return {"success": True}
 
     async def post(self, endpoint, data=None):
         self.calls.append(("POST", endpoint))

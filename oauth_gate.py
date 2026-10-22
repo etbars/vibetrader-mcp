@@ -11,7 +11,9 @@ mcp-oauth-design.md in the main repo). This server only has to:
     user entered: two hosts (the branded domain and the run.app URL) times two
     paths (/mcp and /sse);
   * let through tokens the API issued for one of those URLs, and `vt_` keys
-    sent as a header — the API checks keys on every call, as it always has.
+    sent as a header — the API checks keys on every call, as it always has;
+  * name the caller to the MCP SDK (scope["user"]), which ties each session
+    to whoever opened it and answers anyone else's request on it with 404.
 
 The bearer is then forwarded to the API unchanged, which enforces what the
 connection may do. Written as plain ASGI around the whole app because the app
@@ -20,6 +22,7 @@ own auth wiring would not reach /sse or /messages/.
 """
 import asyncio
 import base64
+import hashlib
 import json
 import logging
 import time
@@ -29,6 +32,8 @@ import httpx
 import jwt
 from jwt.algorithms import RSAAlgorithm
 from fastmcp.server.auth import AccessToken, TokenVerifier
+from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
+from starlette.authentication import AuthCredentials
 
 logger = logging.getLogger(__name__)
 
@@ -129,7 +134,9 @@ class VibeTraderTokenVerifier(TokenVerifier):
 
     async def verify_token(self, token: str) -> Optional[AccessToken]:
         if token.startswith("vt_"):
-            return AccessToken(token=token, client_id="api-key", scopes=[])
+            # The key's hash is its subject, so each key owns its own sessions.
+            return AccessToken(token=token, client_id="api-key", scopes=[],
+                               subject="key:" + hashlib.sha256(token.encode()).hexdigest())
         return await self.jwt_verifier.verify_token(token)
 
 
@@ -178,7 +185,9 @@ class OAuthGate:
             return await self.app(scope, receive, send)
         path = scope.get("path", "")
         method = scope.get("method", "GET").upper()
-        headers = {k.decode().lower(): v.decode() for k, v in scope.get("headers", [])}
+        # latin-1 decodes any bytes: a header that isn't UTF-8 is just a bad
+        # token (401), never a crash.
+        headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope.get("headers", [])}
         host = headers.get("host", "")
 
         if path.startswith(_METADATA) and method in ("GET", "HEAD"):
@@ -196,13 +205,17 @@ class OAuthGate:
         auth = headers.get("authorization", "")
         token = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
         try:
-            verified = bool(token) and await self.verifier.verify_token(token)
+            verified = await self.verifier.verify_token(token) if token else None
         except KeysUnavailable:
             return await self._json(send, 503, {
                 "error": "temporarily_unavailable",
                 "error_description": "Sign-in can't be checked right now. Try again shortly.",
             }, {"retry-after": "30"})
         if verified:
+            # The SDK's transports bind each session to (client, issuer,
+            # subject) of the user that opened it — a refreshed token is the
+            # same user; another user or key gets "Session not found".
+            scope = {**scope, "user": AuthenticatedUser(verified), "auth": AuthCredentials(verified.scopes)}
             return await self.app(scope, receive, send)
 
         challenge = f'Bearer resource_metadata="{_metadata_url(host, path)}", scope="{" ".join(SCOPES)}"'

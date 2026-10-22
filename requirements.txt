@@ -10,6 +10,11 @@
 # two-transport check against the new version.
 fastmcp>=2.14.5,<3.0.0
 
+# The MCP SDK fastmcp runs on. Its floor is ours, not fastmcp's (which allows
+# 1.24): oauth_gate.py names the signed-in user and relies on the SDK, as of
+# the 1.30 we test, to tie each session to that user (tests/test_hardening.py).
+mcp>=1.30,<2.0
+
 # ASGI framework — imported directly by server.py to combine the /mcp and /sse
 # transports into one app. Version floor is fastmcp/mcp's own; the ceiling is
 # the next major.

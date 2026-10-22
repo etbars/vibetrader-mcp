@@ -16,7 +16,7 @@ from fastmcp.exceptions import ToolError
 
 import server
 
-OPEN_WORLD = {"place_order", "close_position", "start_bot", "start_all_bots", "set_signal_mode"}
+OPEN_WORLD = {"place_order", "close_position", "start_bot", "start_all_bots", "set_signal_mode", "update_bot"}
 
 
 def listed():

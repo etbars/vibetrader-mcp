@@ -764,7 +764,8 @@ async def refine_bot(bot_id: str, prompt: str) -> str:
     }, indent=2)
 
 
-@_tool("Update bot", CONSEQUENTIAL)
+# Open world: status "running" starts the bot, which may trade a real account.
+@_tool("Update bot", CONSEQUENTIAL_EXTERNAL)
 async def update_bot(bot_id: str, name: str = None, status: str = None) -> str:
     """Update a bot's name or status.
 
@@ -844,7 +845,13 @@ async def get_positions(mode: str = "paper") -> str:
 
 
 @_tool("Close position", CONSEQUENTIAL_EXTERNAL)
-async def close_position(symbol: str, mode: str = "paper", qty: float = None, percentage: float = None) -> str:
+async def close_position(
+    symbol: str,
+    mode: str = "paper",
+    qty: float = None,
+    percentage: float = None,
+    idempotency_key: Optional[str] = None,
+) -> str:
     """Close a position by symbol in the user's VibeTrader Alpaca account.
 
     This only reaches the Alpaca account (paper or live), the same one
@@ -853,11 +860,16 @@ async def close_position(symbol: str, mode: str = "paper", qty: float = None, pe
     that, tell them to close it in that brokerage's app. Never use this to
     "sell my Robinhood shares": it would sell the Alpaca position instead.
 
+    Retrying is safe: the same close sent again within two minutes of the
+    last try, or with the same idempotency_key, is never sold twice.
+
     Args:
         symbol: Stock/crypto symbol to close (e.g., "AAPL", "BTC/USD")
         mode: Account mode - "paper" (default) or "live"
         qty: Specific quantity to close (optional, closes all if not specified)
         percentage: Percentage of position to close, 0-100 (optional)
+        idempotency_key: Optional. Any string naming this one close. Pass the
+            same key when retrying it; pass a new key to close more on purpose.
     """
     client = get_client()
 
@@ -866,13 +878,28 @@ async def close_position(symbol: str, mode: str = "paper", qty: float = None, pe
         data["qty"] = qty
     if percentage is not None:
         data["percentage"] = percentage
+    # A partial close sent twice sells twice, so it carries an order id the
+    # way place_order does (the "close" key keeps it apart from a sell order).
+    data["client_order_id"] = _mcp_order_id({"close": symbol.upper(), **data}, mode, idempotency_key)
 
     # broker is explicit: the API falls back to "alpaca" when it is
     # missing, and an implicit default is how the wrong account got sold.
-    result = await client.post(
-        f"/trading/portfolio/close/{symbol}?mode={mode}&broker=alpaca",
-        data if data else None,
-    )
+    try:
+        result = await client.post(f"/trading/portfolio/close/{symbol}?mode={mode}&broker=alpaca", data)
+    except ApiUnreachable as e:
+        raise ToolError(
+            f"The close request got no answer ({e.detail}), so the position may or may not have been closed. "
+            "Retry the same call within two minutes (or with the same idempotency_key): a retry never sells "
+            "twice. Or check get_positions first."
+        ) from e
+    except ApiError as e:
+        if e.status == 409 and "already sent" in e.detail:
+            raise ToolError(
+                "This close was already sent (the same close in the last two minutes, or one with this "
+                "idempotency_key), so nothing more was sold. Check get_positions. To close more on purpose, "
+                "call close_position with a new idempotency_key."
+            ) from e
+        raise
 
     return json.dumps({
         "success": True,
@@ -882,7 +909,7 @@ async def close_position(symbol: str, mode: str = "paper", qty: float = None, pe
 
 
 # An agent that times out retries the call, and a retry with a fresh order id
-# is a second real order. So the same order gets the same client_order_id,
+# is a second real order (or close). So the same order gets the same client_order_id,
 # and the API's order log answers the repeat with 409 "already sent".
 #   - With an idempotency_key, the id is a hash of the order and the key: the
 #     same for as long as the caller reuses the key.

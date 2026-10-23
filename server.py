@@ -14,7 +14,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from typing import Literal, Optional
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 
 import httpx
@@ -259,9 +259,61 @@ def _is_signal_bot(bot: dict) -> bool:
     return "alert" in (bot.get("entry_mode"), bot.get("exit_mode"))
 
 
+# =============================================================================
+# Reading the API's numbers
+# =============================================================================
+# The read tools report what the app shows (2026-10-22 audit 15-F8). P&L on a
+# bot, as GET /bots/ and /bots/{id} send it:
+#   realized_pnl   closed trades. Sent by the API since the P&L fix; before it,
+#                  total_pnl is that same realized counter, so it's the fallback.
+#   unrealized_pnl the bot's open lots at the current price; all_time_pnl is
+#                  realized + open. Null until the API sends them, or while an
+#                  open lot has no price (unpriced_symbols names it).
+# Win rate is wins / (wins + losses): a breakeven or an opening buy is neither.
+
+def _money(value) -> Optional[float]:
+    """A dollar (or percent) figure rounded to cents; None when the API sent none."""
+    try:
+        return None if value is None else round(float(value), 2)
+    except (TypeError, ValueError):
+        return None
+
+
+def _pick(row: dict, *keys):
+    """The first of `keys` the row carries a value for (camelCase or snake_case)."""
+    for key in keys:
+        if row.get(key) is not None:
+            return row[key]
+    return None
+
+
+def _win_rate(wins, losses) -> Optional[float]:
+    wins, losses = int(wins or 0), int(losses or 0)
+    return round(wins / (wins + losses) * 100, 1) if wins + losses else None
+
+
+def _bot_pnl(bot: dict) -> dict:
+    """realized_pnl (never None), unrealized_pnl and all_time_pnl (None = unknown)."""
+    return {
+        "realized_pnl": _money(_pick(bot, "realized_pnl", "total_pnl")) or 0.0,
+        "unrealized_pnl": _money(bot.get("unrealized_pnl")),
+        "all_time_pnl": _money(bot.get("all_time_pnl")),
+    }
+
+
+def _bot_win_rate(bot: dict) -> Optional[float]:
+    wins, losses = bot.get("winning_trades"), bot.get("losing_trades")
+    if not int(wins or 0) + int(losses or 0):
+        return None
+    sent = _money(bot.get("win_rate"))
+    return round(sent, 1) if sent is not None else _win_rate(wins, losses)
+
+
 @_tool("List bots", READ_ONLY)
 async def list_bots(mode: Optional[str] = None, limit: int = 100) -> str:
-    """List all your trading bots.
+    """List all your trading bots, with each bot's realized P&L (closed trades),
+    its open P&L and all-time P&L when the API reports them, and its win rate
+    (wins / closed trades).
 
     Args:
         mode: Filter by trading mode - "paper", "live", or None for all bots
@@ -275,8 +327,13 @@ async def list_bots(mode: Optional[str] = None, limit: int = 100) -> str:
         return json.dumps({"message": f"No {mode or ''} bots found", "bots": []})
     summary = []
     for b in bots[:max(1, limit)]:
+        pnl = _bot_pnl(b)
         row = {"id": b.get("id"), "name": b.get("name"), "status": b.get("status"),
-               "trading_mode": b.get("trading_mode"), "total_pnl": round(b.get("total_pnl") or 0, 2)}
+               "trading_mode": b.get("trading_mode"), "realized_pnl": pnl["realized_pnl"]}
+        for key in ("unrealized_pnl", "all_time_pnl"):
+            if pnl[key] is not None:
+                row[key] = pnl[key]
+        row["win_rate"] = _bot_win_rate(b)
         if _is_signal_bot(b):
             row["signal_bot"] = True
         summary.append(row)
@@ -288,7 +345,14 @@ async def list_bots(mode: Optional[str] = None, limit: int = 100) -> str:
 
 @_tool("Get bot", READ_ONLY)
 async def get_bot(bot_id: str) -> str:
-    """Get details of a specific bot"""
+    """Get details of a specific bot.
+
+    P&L fields: total_pnl and realized_pnl are realized (closed trades only);
+    unrealized_pnl is the bot's open positions at the current price and
+    all_time_pnl is realized + open (null while an open position has no price,
+    or on an API that doesn't send them yet). total_trades counts every buy and
+    sell; winning_trades + losing_trades counts closed trades.
+    """
     client = get_client()
     return json.dumps(await client.get(f"/bots/{bot_id}"), indent=2)
 
@@ -462,8 +526,10 @@ async def delete_all_bots(confirm: str, mode: Optional[str] = None) -> str:
 
 @_tool("Get bot stats", READ_ONLY)
 async def get_bot_stats(mode: Optional[str] = None) -> str:
-    """Get aggregate statistics across your bots.
-    
+    """Get aggregate statistics across your bots: realized P&L (closed trades),
+    open and all-time P&L when every bot's open positions are priced, the win
+    rate over all closed trades, and the best and worst bot.
+
     Args:
         mode: Filter by trading mode - "paper", "live", or None for all bots
     """
@@ -471,10 +537,18 @@ async def get_bot_stats(mode: Optional[str] = None) -> str:
     bots = await client.get("/bots/")
     if mode:
         bots = [b for b in bots if b.get("trading_mode") == mode]
-    
+
     if not bots:
         return json.dumps({"message": f"No {mode or ''} bots found"})
-    
+
+    pnls = [_bot_pnl(b) for b in bots]
+
+    def fleet(key: str) -> Optional[float]:
+        values = [p[key] for p in pnls]
+        return round(sum(values), 2) if all(v is not None for v in values) else None
+
+    all_time = fleet("all_time_pnl")
+    basis = "all_time_pnl" if all_time is not None else "realized_pnl"
     stats = {
         "mode_filter": mode or "all",
         "total_bots": len(bots),
@@ -482,14 +556,24 @@ async def get_bot_stats(mode: Optional[str] = None) -> str:
         "paused": len([b for b in bots if b.get("status") == "paused"]),
         "paper_trading": len([b for b in bots if b.get("trading_mode") == "paper"]),
         "live_trading": len([b for b in bots if b.get("trading_mode") == "live"]),
-        "total_pnl": round(sum(b.get("total_pnl", 0) for b in bots), 2),
-        "profitable_bots": len([b for b in bots if b.get("total_pnl", 0) > 0])
+        "realized_pnl": round(sum(p["realized_pnl"] for p in pnls), 2),
+        "unrealized_pnl": fleet("unrealized_pnl"),
+        "all_time_pnl": all_time,
+        "win_rate": _win_rate(sum(int(b.get("winning_trades") or 0) for b in bots),
+                              sum(int(b.get("losing_trades") or 0) for b in bots)),
+        "ranked_by": basis,
+        "profitable_bots": len([p for p in pnls if p[basis] > 0]),
     }
-    
-    sorted_by_pnl = sorted(bots, key=lambda x: x.get("total_pnl", 0), reverse=True)
-    stats["top_performer"] = {"name": sorted_by_pnl[0].get("name"), "pnl": sorted_by_pnl[0].get("total_pnl", 0)}
-    stats["worst_performer"] = {"name": sorted_by_pnl[-1].get("name"), "pnl": sorted_by_pnl[-1].get("total_pnl", 0)}
-    
+    ranked = sorted(zip(bots, pnls), key=lambda bp: bp[1][basis], reverse=True)
+    stats["top_performer"] = {"name": ranked[0][0].get("name"), "pnl": ranked[0][1][basis]}
+    stats["worst_performer"] = {"name": ranked[-1][0].get("name"), "pnl": ranked[-1][1][basis]}
+
+    unpriced = sorted({s for b in bots for s in (b.get("unpriced_symbols") or [])})
+    if unpriced:
+        stats["note"] = (f"Open P&L is unknown while {', '.join(unpriced)} has no current price, so only "
+                         "realized P&L is totalled.")
+    elif all_time is None:
+        stats["note"] = "Open P&L isn't reported for these bots; the P&L here is realized (closed trades) only."
     return json.dumps(stats, indent=2)
 
 
@@ -529,20 +613,27 @@ async def get_market_status() -> str:
 
 @_tool("Get account summary", READ_ONLY)
 async def get_account_summary(mode: str = "paper") -> str:
-    """Get account balance, buying power, and key metrics.
-    
+    """Get the Alpaca account's cash, buying power, value and today's P&L.
+    For open positions and their P&L, use get_positions.
+
     Args:
         mode: Account mode - "paper" (default) or "live" for real money
     """
     client = get_client()
-    portfolio = await client.get(f"/trading/portfolio/account?mode={mode}")
-    
+    account = await client.get(f"/trading/portfolio/account?mode={mode}")
+
+    # The keys GET /trading/portfolio/account sends (it used to read
+    # cash_available / total_value, which it never sent: always 0).
     return json.dumps({
-        "cash_available": portfolio.get("cash_available", 0),
-        "buying_power": portfolio.get("buying_power", 0),
-        "portfolio_value": portfolio.get("total_value", 0),
-        "unrealized_pnl": portfolio.get("total_unrealized_pnl", 0),
-        "position_count": portfolio.get("position_count", 0)
+        "mode": mode,
+        "cash": _money(account.get("cash")),
+        "buying_power": _money(account.get("buying_power")),
+        "portfolio_value": _money(_pick(account, "portfolio_value", "equity")),
+        "equity": _money(account.get("equity")),
+        "day_pnl": _money(account.get("day_pnl")),
+        "day_pnl_percent": _money(account.get("day_pnl_percent")),
+        "status": account.get("status"),
+        "trading_blocked": account.get("trading_blocked"),
     }, indent=2)
 
 
@@ -580,7 +671,8 @@ async def get_trade_history(mode: str = "paper", limit: int = 20) -> str:
     if not trades:
         return json.dumps({"message": f"No {mode} trades found", "trades": []})
     
-    # Format trades for readability
+    # Format trades for readability. The route's rows carry filled_price (the
+    # fill) and price (the decision price); there is no filled_avg_price.
     formatted = []
     for t in trades:
         formatted.append({
@@ -588,8 +680,8 @@ async def get_trade_history(mode: str = "paper", limit: int = 20) -> str:
             "symbol": t.get("symbol"),
             "side": t.get("side"),
             "qty": t.get("qty"),
-            "price": t.get("filled_avg_price"),
-            "pnl": round(t.get("pnl", 0), 2) if t.get("pnl") else None,
+            "price": _pick(t, "filled_price", "price"),
+            "pnl": _money(t.get("pnl")),    # null on an opening trade; 0.0 is a breakeven close
             "timestamp": t.get("timestamp"),
         })
     
@@ -602,84 +694,119 @@ async def get_trade_history(mode: str = "paper", limit: int = 20) -> str:
 
 @_tool("Get bot trades", READ_ONLY)
 async def get_bot_trades(bot_id: str, limit: int = 20) -> str:
-    """Get trade history for a specific bot.
-    
+    """Get a bot's recent trades, newest first, with its whole record.
+
+    `summary` is the bot's whole record (from the bot itself, not this page):
+    realized P&L, open and all-time P&L when reported, total_trades (every buy
+    and sell), closed_trades (round trips), wins, losses and the win rate
+    (wins / closed trades). `shown` covers only the rows returned. A closing
+    trade (a sell of a long, or the buy that covers a short) has entry_price,
+    exit_price and its P&L; an opening trade has price and no P&L.
+
     Args:
         bot_id: The bot ID to get trades for
         limit: Number of trades to return (default 20, max 200)
     """
     client = get_client()
-    limit = min(limit, 200)
-    trades = await client.get(f"/trading/bots/{bot_id}/trades?limit={limit}")
-    
-    if not trades:
-        return json.dumps({"message": "No trades found for this bot", "trades": []})
-    
-    # Calculate summary stats
-    total_pnl = sum(t.get("pnl", 0) or 0 for t in trades)
-    winning = len([t for t in trades if (t.get("pnl") or 0) > 0])
-    losing = len([t for t in trades if (t.get("pnl") or 0) < 0])
-    
-    formatted = []
+    limit = max(1, min(limit, 200))
+    trades, bot = await asyncio.gather(
+        client.get(f"/trading/bots/{_seg(bot_id)}/trades?limit={limit}"),
+        client.get(f"/bots/{_seg(bot_id)}"),
+    )
+    trades = trades or []
+
+    # TradeSummary rows are camelCase (filledPrice, entryPrice, pnlPercent,
+    # createdAt); snake_case is read too in case the serializer changes.
+    formatted, shown_pnl, shown_closed = [], 0.0, 0
     for t in trades[:limit]:
-        formatted.append({
-            "symbol": t.get("symbol"),
-            "side": t.get("side"),
-            "qty": t.get("qty"),
-            "entry_price": t.get("entry_price"),
-            "exit_price": t.get("exit_price"),
-            "pnl": round(t.get("pnl", 0), 2) if t.get("pnl") else None,
-            "pnl_percent": round(t.get("pnl_percent", 0), 2) if t.get("pnl_percent") else None,
-            "timestamp": t.get("timestamp"),
-        })
-    
-    return json.dumps({
+        pnl = _money(t.get("pnl"))
+        filled = _pick(t, "filledPrice", "filled_price")
+        row = {"symbol": t.get("symbol"), "side": t.get("side"), "qty": t.get("qty"),
+               "status": t.get("status"), "time": _pick(t, "createdAt", "created_at"), "pnl": pnl}
+        if pnl is not None:
+            shown_closed += 1
+            shown_pnl += pnl
+            row["entry_price"] = _pick(t, "entryPrice", "entry_price")
+            row["exit_price"] = filled
+            row["pnl_percent"] = _money(_pick(t, "pnlPercent", "pnl_percent"))
+        else:
+            row["price"] = filled
+        for out_key, keys in (("reason", ("triggerReason", "trigger_reason")),
+                              ("option_action", ("optionAction", "option_action"))):
+            value = _pick(t, *keys)
+            if value:
+                row[out_key] = value
+        formatted.append(row)
+
+    wins, losses = int(bot.get("winning_trades") or 0), int(bot.get("losing_trades") or 0)
+    out = {
         "bot_id": bot_id,
         "summary": {
-            "total_trades": len(trades),
-            "total_pnl": round(total_pnl, 2),
-            "winning_trades": winning,
-            "losing_trades": losing,
-            "win_rate": round(winning / len(trades) * 100, 1) if trades else 0
+            **_bot_pnl(bot),
+            "total_trades": int(bot.get("total_trades") or 0),
+            "closed_trades": wins + losses,
+            "winning_trades": wins,
+            "losing_trades": losses,
+            "win_rate": _bot_win_rate(bot),
         },
-        "trades": formatted
-    }, indent=2)
+        "shown": {"rows": len(formatted), "closed": shown_closed, "realized_pnl": round(shown_pnl, 2)},
+        "trades": formatted,
+    }
+    if not formatted:
+        out["message"] = "No trades found for this bot"
+    return json.dumps(out, indent=2)
 
 
 @_tool("Get daily trade stats", READ_ONLY)
 async def get_daily_trade_stats(bot_id: str, days: int = 30) -> str:
-    """Get daily trading statistics for a bot.
-    
+    """Get a bot's trading day by day over the last `days` calendar days:
+    trades (every buy and sell), closed trades, wins, losses and realized P&L
+    (closed trades only; open positions are in get_bot), with the best and
+    worst day.
+
     Args:
         bot_id: The bot ID to get stats for
-        days: Number of days to look back (default 30)
+        days: Number of calendar days to look back, today included (default 30, max 365)
     """
     client = get_client()
-    stats = await client.get(f"/trading/bots/{bot_id}/trades/stats/daily")
-    
-    if not stats:
-        return json.dumps({"message": "No daily stats available", "stats": []})
-    
-    # Limit to requested days
-    stats = stats[:days]
-    
-    # Calculate totals
-    total_trades = sum(s.get("trade_count", 0) for s in stats)
-    total_pnl = sum(s.get("total_pnl", 0) for s in stats)
-    best_day = max(stats, key=lambda x: x.get("total_pnl", 0)) if stats else None
-    worst_day = min(stats, key=lambda x: x.get("total_pnl", 0)) if stats else None
-    
+    days = max(1, min(int(days), 365))
+    start = (_utc_now().date() - timedelta(days=days - 1)).isoformat()
+    stats = await client.get(f"/trading/bots/{_seg(bot_id)}/trades/stats/daily?start_date={start}")
+
+    # DailyTradeStats rows: date, total_trades, buy_trades, sell_trades,
+    # total_volume, realized_pnl, winning_trades, losing_trades, newest first.
+    # (This read trade_count / total_pnl, which the API never sent: every
+    # summary said 0 trades and $0.00.) Filtered here as well, for an API
+    # that doesn't apply start_date yet.
+    rows = [s for s in (stats or []) if str(s.get("date") or "")[:10] >= start]
+    if not rows:
+        return json.dumps({"bot_id": bot_id, "period_days": days,
+                           "message": f"No trades in the last {days} days", "daily_stats": []})
+
+    def pnl(row) -> float:
+        return float(row.get("realized_pnl") or 0)
+
+    realized = sum(pnl(s) for s in rows)
+    wins = sum(int(s.get("winning_trades") or 0) for s in rows)
+    losses = sum(int(s.get("losing_trades") or 0) for s in rows)
+    best, worst = max(rows, key=pnl), min(rows, key=pnl)
     return json.dumps({
         "bot_id": bot_id,
-        "period_days": len(stats),
+        "period_days": days,
+        "since": start,
         "summary": {
-            "total_trades": total_trades,
-            "total_pnl": round(total_pnl, 2),
-            "avg_daily_pnl": round(total_pnl / len(stats), 2) if stats else 0,
-            "best_day": {"date": best_day.get("date"), "pnl": best_day.get("total_pnl")} if best_day else None,
-            "worst_day": {"date": worst_day.get("date"), "pnl": worst_day.get("total_pnl")} if worst_day else None,
+            "total_trades": sum(int(s.get("total_trades") or 0) for s in rows),
+            "closed_trades": wins + losses,
+            "winning_trades": wins,
+            "losing_trades": losses,
+            "win_rate": _win_rate(wins, losses),
+            "realized_pnl": round(realized, 2),
+            "trading_days": len(rows),
+            "avg_realized_pnl_per_trading_day": round(realized / len(rows), 2),
+            "best_day": {"date": best.get("date"), "realized_pnl": _money(pnl(best))},
+            "worst_day": {"date": worst.get("date"), "realized_pnl": _money(pnl(worst))},
         },
-        "daily_stats": stats
+        "daily_stats": rows,
     }, indent=2)
 
 
@@ -819,19 +946,25 @@ async def get_positions(mode: str = "paper") -> str:
     total_pnl = 0
 
     for p in positions:
-        market_value = float(p.get("market_value", 0))
-        unrealized_pl = float(p.get("unrealized_pl", 0))
+        # The route sends unrealized_pnl and unrealized_pnl_percent (already a
+        # percent). This read Alpaca's raw unrealized_pl / unrealized_plpc,
+        # which it never sends: every position showed $0.00 open P&L.
+        market_value = float(p.get("market_value") or 0)
+        pct = _pick(p, "unrealized_pnl_percent")
+        if pct is None and p.get("unrealized_plpc") is not None:
+            pct = float(p["unrealized_plpc"]) * 100
+        unrealized_pl = float(_pick(p, "unrealized_pnl", "unrealized_pl") or 0)
         total_value += market_value
         total_pnl += unrealized_pl
 
         formatted.append({
             "symbol": p.get("symbol"),
-            "qty": float(p.get("qty", 0)),
-            "avg_entry_price": float(p.get("avg_entry_price", 0)),
-            "current_price": float(p.get("current_price", 0)),
+            "qty": float(p.get("qty") or 0),
+            "avg_entry_price": float(p.get("avg_entry_price") or 0),
+            "current_price": float(p.get("current_price") or 0),
             "market_value": round(market_value, 2),
             "unrealized_pnl": round(unrealized_pl, 2),
-            "unrealized_pnl_percent": round(float(p.get("unrealized_plpc", 0)) * 100, 2),
+            "unrealized_pnl_percent": _money(pct),
             "side": p.get("side", "long")
         })
 
@@ -1056,15 +1189,21 @@ async def run_backtest(
     Run a historical backtest for a bot's current strategy.
 
     Simulates how the strategy would have performed on historical data.
-    Returns ROI, max drawdown, win rate, trade count, and equity curve.
+    Returns the return, what simply holding the same symbols over the same
+    window returned (buy_hold_return_pct, and vs_buy_and_hold_pct = strategy
+    minus holding), max drawdown, win rate and trade count. ignored_conditions
+    lists rules the backtest can't model; the live bot still applies them, so
+    results can differ. Report the buy-and-hold comparison with the return.
 
     Args:
         bot_id: The bot ID to backtest
-        start_date: Start date (YYYY-MM-DD). Default: 30 days ago
+        start_date: Start date (YYYY-MM-DD). Default: 30 days before end_date
+            (DCA bots: 6 months; covered-call and wheel bots: 1 year)
         end_date: End date (YYYY-MM-DD). Default: today
         initial_capital: Starting capital for simulation (default: $10,000)
 
-    Note: Max 30-day lookback for standard bots. Covered call bots support up to 3 years.
+    Note: a standard or DCA backtest covers at most 365 days; a longer range
+    is trimmed to its last 365 days.
     """
     client = get_client()
 
@@ -1091,10 +1230,25 @@ async def run_backtest(
         "avg_trade_pnl": round(result.get("avg_trade_pnl", 0), 2),
         "best_trade": round(result.get("best_trade", 0), 2),
         "worst_trade": round(result.get("worst_trade", 0), 2),
+        **_vs_holding(result),
         "backtest_id": result.get("id")
     }
 
     return json.dumps(summary, indent=2)
+
+
+def _vs_holding(result: dict) -> dict:
+    """The comparison the web app shows with every backtest (2026-10-22 audit
+    05-F17): holding the same symbols over the same window, and the rules the
+    backtest couldn't model. buy_hold_return_pct is null when the API has no
+    benchmark for the run."""
+    hold = _money(result.get("buy_hold_return_pct"))
+    strategy = _money(result.get("total_return"))
+    return {
+        "buy_hold_return_pct": hold,
+        "vs_buy_and_hold_pct": round(strategy - hold, 2) if hold is not None and strategy is not None else None,
+        "ignored_conditions": list(result.get("ignored_conditions") or []),
+    }
 
 
 @_tool("List backtests", READ_ONLY)
@@ -1119,6 +1273,7 @@ async def list_backtests(bot_id: str) -> str:
             "id": bt.get("id"),
             "period": f"{bt.get('start_date')} to {bt.get('end_date')}",
             "return_pct": round(bt.get("total_return", 0), 2),
+            "buy_hold_return_pct": _money(bt.get("buy_hold_return_pct")),
             "trades": bt.get("total_trades", 0),
             "win_rate_pct": round(bt.get("win_rate", 0), 2),
             "max_drawdown_pct": round(bt.get("max_drawdown_percent", 0), 2)
@@ -1165,7 +1320,8 @@ async def get_backtest(bot_id: str, backtest_id: str) -> str:
         "best_trade": round(result.get("best_trade", 0), 2),
         "worst_trade": round(result.get("worst_trade", 0), 2),
         "trade_count": len(result.get("trades", [])),
-        "equity_curve_points": len(result.get("equity_curve", []))
+        "equity_curve_points": len(result.get("equity_curve", [])),
+        **_vs_holding(result),
     }, indent=2)
 
 
@@ -1210,9 +1366,14 @@ async def quick_covered_call_backtest(
 
 @_tool("Preview bot", READ_ONLY)
 async def preview_bot(bot_id: str) -> str:
-    """Quick 30-day backtest of a bot, not saved: estimated profit and return,
-    trade count and win rate. Use it right after create_bot to see whether the
-    strategy trades at all before running it.
+    """Quick backtest of a bot, not saved: estimated profit and return, trade
+    count, win rate, and what simply holding the same symbols would have
+    returned (buy_hold_return_pct); report that comparison with the return.
+    The window fits the strategy's timeframe: 45 days on minute bars, 120 on
+    hourly, a year on daily or slower (covered calls: 6 months); the message
+    names it. ignored_conditions lists rules the preview can't model. Use it
+    right after create_bot to see whether the strategy trades at all before
+    running it.
 
     Args:
         bot_id: The bot ID to preview

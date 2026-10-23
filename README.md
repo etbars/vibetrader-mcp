@@ -62,7 +62,7 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that c
 | `get_quote` | Get current quote for a stock |
 | `list_indicators` | List every technical indicator bots can use, with parameters and outputs (no API key needed) |
 | `get_market_status` | Check if US stock markets are currently open |
-| `preview_bot` | Quick 30-day backtest of a bot, not saved |
+| `preview_bot` | Quick backtest of a bot, not saved, with the buy-and-hold comparison (window fits the strategy: 45 days to a year) |
 | `run_backtest` | Run a historical backtest for a bot's current strategy |
 | `list_backtests` | List all backtests for a bot |
 | `get_backtest` | Get detailed results for a specific backtest |

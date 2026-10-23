@@ -277,3 +277,34 @@ def test_account_summary_reads_the_keys_the_api_sends(monkeypatch):
     assert out["trading_blocked"] is False
     # never a made-up 0 for figures the route doesn't send
     assert "position_count" not in out and "unrealized_pnl" not in out
+
+
+# --- review round 1: a failed bot read still returns the rows ---------------------
+
+class _BotReadFails(_Api):
+    async def get(self, endpoint):
+        if endpoint.split("?")[0] == "/bots/b1":
+            raise server.ApiError(503, "Service Unavailable")
+        return await super().get(endpoint)
+
+
+def test_bot_trades_survive_a_failed_bot_read(monkeypatch):
+    api = _BotReadFails({"/trading/bots/b1/trades": TRADES})
+    monkeypatch.setattr(server, "get_client", lambda: api)
+    out = json.loads(asyncio.run(server.get_bot_trades.fn(bot_id="b1")))
+    assert len(out["trades"]) == 3
+    assert out["summary"] is None                    # no whole-bot totals invented from a page
+    assert out["shown"] == {"rows": 3, "closed": 2, "realized_pnl": 15.0}
+    assert "only the rows shown" in out["note"]
+
+
+def test_bot_trades_still_fail_when_the_trades_read_fails(monkeypatch):
+    class _TradesFail(_Api):
+        async def get(self, endpoint):
+            if endpoint.startswith("/trading/bots/b1/trades"):
+                raise server.ApiError(404, "Bot not found: b1")
+            return await super().get(endpoint)
+
+    monkeypatch.setattr(server, "get_client", lambda: _TradesFail({"/bots/b1": BOT_MAIN}))
+    with pytest.raises(server.ApiError, match="Bot not found"):
+        asyncio.run(server.get_bot_trades.fn(bot_id="b1"))

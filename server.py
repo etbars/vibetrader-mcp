@@ -699,7 +699,8 @@ async def get_bot_trades(bot_id: str, limit: int = 20) -> str:
     `summary` is the bot's whole record (from the bot itself, not this page):
     realized P&L, open and all-time P&L when reported, total_trades (every buy
     and sell), closed_trades (round trips), wins, losses and the win rate
-    (wins / closed trades). `shown` covers only the rows returned. A closing
+    (wins / closed trades); null, with a note, when the bot can't be read. `shown`
+    covers only the rows returned. A closing
     trade (a sell of a long, or the buy that covers a short) has entry_price,
     exit_price and its P&L; an opening trade has price and no P&L.
 
@@ -712,7 +713,14 @@ async def get_bot_trades(bot_id: str, limit: int = 20) -> str:
     trades, bot = await asyncio.gather(
         client.get(f"/trading/bots/{_seg(bot_id)}/trades?limit={limit}"),
         client.get(f"/bots/{_seg(bot_id)}"),
+        return_exceptions=True,
     )
+    if isinstance(trades, BaseException):
+        raise trades
+    # The rows are the answer; the bot's own record is extra. If it can't be
+    # read, return the rows with page-only figures rather than fail.
+    if isinstance(bot, BaseException):
+        bot = None
     trades = trades or []
 
     # TradeSummary rows are camelCase (filledPrice, entryPrice, pnlPercent,
@@ -738,20 +746,26 @@ async def get_bot_trades(bot_id: str, limit: int = 20) -> str:
                 row[out_key] = value
         formatted.append(row)
 
-    wins, losses = int(bot.get("winning_trades") or 0), int(bot.get("losing_trades") or 0)
-    out = {
-        "bot_id": bot_id,
-        "summary": {
+    summary = None
+    if bot is not None:
+        wins, losses = int(bot.get("winning_trades") or 0), int(bot.get("losing_trades") or 0)
+        summary = {
             **_bot_pnl(bot),
             "total_trades": int(bot.get("total_trades") or 0),
             "closed_trades": wins + losses,
             "winning_trades": wins,
             "losing_trades": losses,
             "win_rate": _bot_win_rate(bot),
-        },
+        }
+    out = {
+        "bot_id": bot_id,
+        "summary": summary,
         "shown": {"rows": len(formatted), "closed": shown_closed, "realized_pnl": round(shown_pnl, 2)},
         "trades": formatted,
     }
+    if summary is None:
+        out["note"] = ("The bot's own totals couldn't be read just now; the figures in `shown` cover "
+                       "only the rows shown, not the bot's whole record. Try get_bot for its totals.")
     if not formatted:
         out["message"] = "No trades found for this bot"
     return json.dumps(out, indent=2)

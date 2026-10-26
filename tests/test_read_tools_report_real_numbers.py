@@ -308,3 +308,16 @@ def test_bot_trades_still_fail_when_the_trades_read_fails(monkeypatch):
     monkeypatch.setattr(server, "get_client", lambda: _TradesFail({"/bots/b1": BOT_MAIN}))
     with pytest.raises(server.ApiError, match="Bot not found"):
         asyncio.run(server.get_bot_trades.fn(bot_id="b1"))
+
+
+def test_run_backtest_docstring_names_every_default_window():
+    run = server.run_backtest.description
+    assert "30 days" in run and "180 days" in run and "365 days" in run
+
+
+def test_list_backtests_reports_ignored_conditions(monkeypatch):
+    rows = [{"id": "x", "start_date": "a", "end_date": "b", "total_return": 1.0,
+             "ignored_conditions": ["vix_level"], "total_trades": 1, "win_rate": 50.0,
+             "max_drawdown_percent": 1.0}]
+    _, out = _run(monkeypatch, server.list_backtests, {"/backtest/bots/b1/backtests": rows}, bot_id="b1")
+    assert out["backtests"][0]["ignored_conditions"] == ["vix_level"]

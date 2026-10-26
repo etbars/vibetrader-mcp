@@ -1212,12 +1212,12 @@ async def run_backtest(
     Args:
         bot_id: The bot ID to backtest
         start_date: Start date (YYYY-MM-DD). Default: 30 days before end_date
-            (DCA bots: 6 months; covered-call and wheel bots: 1 year)
+            (DCA bots: 180 days; covered-call and wheel bots: 365 days)
         end_date: End date (YYYY-MM-DD). Default: today
         initial_capital: Starting capital for simulation (default: $10,000)
 
     Note: a standard or DCA backtest covers at most 365 days; a longer range
-    is trimmed to its last 365 days.
+    is trimmed to its last 365 days (the start moves forward, the end stays).
     """
     client = get_client()
 
@@ -1288,6 +1288,7 @@ async def list_backtests(bot_id: str) -> str:
             "period": f"{bt.get('start_date')} to {bt.get('end_date')}",
             "return_pct": round(bt.get("total_return", 0), 2),
             "buy_hold_return_pct": _money(bt.get("buy_hold_return_pct")),
+            "ignored_conditions": list(bt.get("ignored_conditions") or []),
             "trades": bt.get("total_trades", 0),
             "win_rate_pct": round(bt.get("win_rate", 0), 2),
             "max_drawdown_pct": round(bt.get("max_drawdown_percent", 0), 2)

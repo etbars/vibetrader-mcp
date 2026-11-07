@@ -832,7 +832,9 @@ async def get_daily_trade_stats(bot_id: str, days: int = 30) -> str:
 async def get_bot_strategy(bot_id: str) -> str:
     """Get the full strategy configuration for a bot.
 
-    Returns entry rules, exit rules, indicators, risk settings, and symbols.
+    Returns the strategy as VibeTrader stores it: symbols, entry and exit
+    conditions (each with its own timeframe), position sizing, risk controls,
+    order settings and schedule.
 
     Args:
         bot_id: The bot ID to get strategy for
@@ -840,21 +842,20 @@ async def get_bot_strategy(bot_id: str) -> str:
     client = get_client()
     strategy = await client.get(f"/strategy/bots/{bot_id}/strategy")
 
-    # Extract key info from strategy_json
-    strat_json = strategy.get("strategy_json", {})
+    # Pass the stored strategy through instead of re-mapping it field by
+    # field: the old mapping read names the API never used (entry_rules,
+    # exit_rules, indicators, risk_management), so every bot's rules came
+    # back empty (2026-11-07). `mode` is StrategyJSON's Literal["paper"]
+    # schema default, not the bot's trading mode, and `version` is the schema
+    # version, so neither is shown; get_bot has the bot's real mode.
+    strat_json = strategy.get("strategy_json") or {}
+    shown = {k: v for k, v in strat_json.items()
+             if k not in ("mode", "version") and v not in (None, {}, [])}
 
     return json.dumps({
         "bot_id": bot_id,
         "version": strategy.get("version", 1),
-        "strategy": {
-            "symbols": strat_json.get("symbols", []),
-            "entry_rules": strat_json.get("entry_rules", []),
-            "exit_rules": strat_json.get("exit_rules", []),
-            "indicators": strat_json.get("indicators", []),
-            "position_sizing": strat_json.get("position_sizing", {}),
-            "risk_management": strat_json.get("risk_management", {}),
-            "strategy_type": strat_json.get("strategy_type", "standard"),
-        },
+        "strategy": shown,
         "generated_code": strategy.get("generated_code", ""),
         "created_at": strategy.get("created_at"),
     }, indent=2)

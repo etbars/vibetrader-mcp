@@ -15,6 +15,16 @@ fastmcp>=2.14.5,<3.0.0
 # the 1.30 we test, to tie each session to that user (tests/test_hardening.py).
 mcp>=1.30,<2.0
 
+# The ceiling is the mcp SDK's, not ours. anyio 4.16.0 (2026-11-01) wakes a
+# reader whose memory stream is closed under it with ClosedResourceError,
+# where 4.15 left it waiting until its task was cancelled. mcp 1.x's
+# standalone_sse_writer only expects the old behaviour, so every GET /mcp
+# stream Cloud Run cuts at its 120 s timeout began logging an ERROR traceback
+# (00069-rs8, the first rebuild after the release; 0 on 00068 in 12 days).
+# mcp 2.x catches it. Lift this with the move to mcp 2, and
+# tests/test_anyio_ceiling.py shows why.
+anyio>=4.5,<4.16
+
 # ASGI framework — imported directly by server.py to combine the /mcp and /sse
 # transports into one app. Version floor is fastmcp/mcp's own; the ceiling is
 # the next major.

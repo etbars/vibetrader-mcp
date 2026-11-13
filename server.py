@@ -310,26 +310,49 @@ def _bot_win_rate(bot: dict) -> Optional[float]:
 
 
 @_tool("List bots", READ_ONLY)
-async def list_bots(mode: Optional[str] = None, limit: int = 100) -> str:
-    """List all your trading bots, with each bot's realized P&L (closed trades),
-    its open P&L and all-time P&L when the API reports them, and its win rate
-    (wins / closed trades).
+async def list_bots(mode: Optional[str] = None, status: Optional[str] = None,
+                    name_contains: Optional[str] = None, limit: int = 100) -> str:
+    """List your trading bots, newest first, with each bot's symbols, status,
+    creation time, realized P&L (closed trades), its open P&L and all-time P&L
+    when the API reports them, and its win rate (wins / closed trades).
+
+    Accounts can hold hundreds of bots, many of them paused experiments:
+    narrow the list with status and name_contains rather than reading it all.
 
     Args:
-        mode: Filter by trading mode - "paper", "live", or None for all bots
+        mode: "paper" or "live" (default: both)
+        status: Only bots with this status, e.g. "running", "paused", "stopped",
+            "draft" or "error" (default: every status)
+        name_contains: Only bots whose name contains this text, any case
         limit: Most bots to return (default 100)
     """
     client = get_client()
-    bots = await client.get("/bots/")
+    every = await client.get("/bots/")
+    bots = every
     if mode:
         bots = [b for b in bots if b.get("trading_mode") == mode]
+    if status:
+        bots = [b for b in bots if str(b.get("status") or "").lower() == status.strip().lower()]
+    if name_contains:
+        needle = name_contains.strip().lower()
+        bots = [b for b in bots if needle in str(b.get("name") or "").lower()]
     if not bots:
-        return json.dumps({"message": f"No {mode or ''} bots found", "bots": []})
+        statuses = sorted({str(b.get("status")) for b in every if b.get("status")})
+        asked = " ".join(x for x in (status, mode) if x)
+        named = f' named like "{name_contains}"' if name_contains else ""
+        message = f"No {asked + ' ' if asked else ''}bots{named} found."
+        if statuses:
+            message += f" Statuses on this account: {', '.join(statuses)}."
+        return json.dumps({"message": message, "total": len(every), "bots": []})
+    # Newest first; a bot with no creation time sorts last (ISO strings in one
+    # format compare as times).
+    bots = sorted(bots, key=lambda b: str(b.get("created_at") or ""), reverse=True)
     summary = []
     for b in bots[:max(1, limit)]:
         pnl = _bot_pnl(b)
         row = {"id": b.get("id"), "name": b.get("name"), "status": b.get("status"),
-               "trading_mode": b.get("trading_mode"), "realized_pnl": pnl["realized_pnl"]}
+               "trading_mode": b.get("trading_mode"), "symbols": b.get("symbols") or [],
+               "created_at": b.get("created_at"), "realized_pnl": pnl["realized_pnl"]}
         for key in ("unrealized_pnl", "all_time_pnl"):
             if pnl[key] is not None:
                 row[key] = pnl[key]
@@ -337,9 +360,10 @@ async def list_bots(mode: Optional[str] = None, limit: int = 100) -> str:
         if _is_signal_bot(b):
             row["signal_bot"] = True
         summary.append(row)
-    out = {"total": len(bots), "bots": summary}
+    out = {"total": len(every), "matched": len(bots), "bots": summary}
     if len(summary) < len(bots):
-        out["note"] = f"Showing {len(summary)} of {len(bots)}. Raise limit, or use search_bots."
+        out["note"] = (f"Showing {len(summary)} of {len(bots)}. Raise limit, narrow with status or "
+                       f"name_contains, or use search_bots.")
     return json.dumps(out, indent=2)
 
 
@@ -357,15 +381,70 @@ async def get_bot(bot_id: str) -> str:
     return json.dumps(await client.get(f"/bots/{bot_id}"), indent=2)
 
 
+def _shown_rules(strategy_json: dict) -> dict:
+    """The stored rules as get_bot_strategy shows them. `mode` is StrategyJSON's
+    schema default and `version` the schema version, so neither is shown."""
+    return {k: v for k, v in (strategy_json or {}).items()
+            if k not in ("mode", "version") and v not in (None, {}, [])}
+
+
+async def _what_was_built(client, bot: dict) -> dict:
+    """A create or refine answer: the bot, the rules the builder saved, and
+    everything it changed from the request. The builder can't express every
+    request; it records each change in validation_adjustments, and an agent that
+    sees only an id passes a rewritten bot off as the one the user asked for
+    (2026-11-13: a two-leg KO/PEP pair came back KO-only with no word said)."""
+    bot_id = bot.get("id")
+    out = {"status": "success",
+           "bot": {"id": bot_id, "name": bot.get("name"), "status": bot.get("status"),
+                   "trading_mode": bot.get("trading_mode"),
+                   "strategy_version": bot.get("strategy_version")}}
+    try:
+        strategy = await client.get(f"/strategy/bots/{_seg(bot_id)}/strategy")
+    except ApiError:
+        # The bot exists: never report a failed create or refine over a failed read.
+        out["note"] = ("The bot was saved, but its rules couldn't be read back just now. "
+                       "Call get_bot_strategy to check them before starting it.")
+        return out
+    sj = strategy.get("strategy_json") or {}
+    out["bot"]["symbols"] = sj.get("symbols") or []
+    out["rules"] = _shown_rules(sj)
+    out["changes_to_your_request"] = list(strategy.get("validation_adjustments") or [])
+    out["warnings"] = list(strategy.get("validation_warnings") or [])
+    if strategy.get("start_refusal"):
+        out["start_refusal"] = strategy["start_refusal"]
+    if out["changes_to_your_request"]:
+        out["note"] = ("The builder changed or left out part of the request "
+                       "(changes_to_your_request). Tell the user what changed before they start "
+                       "the bot, and compare the rules with what they asked for.")
+    return out
+
+
 @_tool("Create bot", SAFE_WRITE)
 async def create_bot(prompt: str, name: Optional[str] = None) -> str:
-    """Create a new trading bot using natural language"""
+    """Create a new trading bot from a plain-English description. The bot is
+    saved paused; nothing trades until start_bot.
+
+    The answer has the rules the builder saved (rules), the bot's status and
+    trading mode, the builder's warnings, and changes_to_your_request: every
+    part of the description it changed or could not build. Always read the
+    rules and changes_to_your_request back to the user; never describe the bot
+    as the one they asked for when the two differ.
+
+    Pair trades: "buy KO when it is cheap against PEP" builds one symbol
+    against a partner; "buy whichever of KO and PEP is cheap against the other"
+    builds one bot that holds either leg.
+
+    Args:
+        prompt: The strategy in plain English (symbols, entry, exit, sizing)
+        name: Optional bot name
+    """
     client = get_client()
     data = {"prompt": prompt}
     if name:
         data["name"] = name
     bot = await client.post("/bots/", data)
-    return json.dumps({"status": "success", "bot": {"id": bot.get("id"), "name": bot.get("name")}}, indent=2)
+    return json.dumps(await _what_was_built(client, bot), indent=2, default=str)
 
 
 @_tool("Start bot", CONSEQUENTIAL_EXTERNAL)
@@ -888,22 +967,19 @@ async def refine_bot(bot_id: str, prompt: str) -> str:
     Describe changes you want to make to the strategy. The bot will be paused
     during refinement and a new strategy version will be created.
 
+    The answer has the new rules, the bot's status and mode, the builder's
+    warnings, and changes_to_your_request: every part of the request it changed
+    or could not build. Read them back to the user.
+
     Args:
         bot_id: The bot ID to refine
         prompt: Natural language description of changes (e.g., "add a trailing stop of 5%")
     """
     client = get_client()
     bot = await client.post(f"/bots/{bot_id}/refine", {"prompt": prompt})
-    return json.dumps({
-        "success": True,
-        "message": f"Strategy refined for '{bot.get('name')}'",
-        "bot": {
-            "id": bot.get("id"),
-            "name": bot.get("name"),
-            "status": bot.get("status"),
-            "strategy_version": bot.get("strategy_version")
-        }
-    }, indent=2)
+    out = await _what_was_built(client, {**bot, "id": bot.get("id") or bot_id})
+    out["message"] = f"Strategy refined for '{bot.get('name')}'"
+    return json.dumps(out, indent=2, default=str)
 
 
 # Open world: status "running" starts the bot, which may trade a real account.

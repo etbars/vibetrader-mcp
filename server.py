@@ -1465,7 +1465,10 @@ async def preview_bot(bot_id: str) -> str:
     hourly, a year on daily or slower (covered calls: 6 months); the message
     names it. ignored_conditions lists rules the preview can't model. Use it
     right after create_bot to see whether the strategy trades at all before
-    running it.
+    running it. When the rule trades less than once a month, frequency.rare
+    is true and frequency.suggestion (when there is one) names the smallest
+    loosening that would have traded more: from_label -> to_label and the
+    trades it would have made. Offer it to the user; refine_bot applies it.
 
     Args:
         bot_id: The bot ID to preview

@@ -309,6 +309,17 @@ def _bot_win_rate(bot: dict) -> Optional[float]:
     return round(sent, 1) if sent is not None else _win_rate(wins, losses)
 
 
+def _created_key(bot: dict) -> float:
+    raw = bot.get("created_at")
+    try:
+        t = datetime.fromisoformat(str(raw).strip().replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return float("-inf")
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=timezone.utc)
+    return t.timestamp()
+
+
 @_tool("List bots", READ_ONLY)
 async def list_bots(mode: Optional[str] = None, status: Optional[str] = None,
                     name_contains: Optional[str] = None, limit: int = 100) -> str:
@@ -343,10 +354,10 @@ async def list_bots(mode: Optional[str] = None, status: Optional[str] = None,
         message = f"No {asked + ' ' if asked else ''}bots{named} found."
         if statuses:
             message += f" Statuses on this account: {', '.join(statuses)}."
-        return json.dumps({"message": message, "total": len(every), "bots": []})
-    # Newest first; a bot with no creation time sorts last (ISO strings in one
-    # format compare as times).
-    bots = sorted(bots, key=lambda b: str(b.get("created_at") or ""), reverse=True)
+        return json.dumps({"message": message, "total": len(every), "matched": 0, "bots": []})
+    # Newest first, by the time itself (Z, +00:00 and fractional seconds all
+    # read alike); a bot with no readable creation time sorts last.
+    bots = sorted(bots, key=_created_key, reverse=True)
     summary = []
     for b in bots[:max(1, limit)]:
         pnl = _bot_pnl(b)
@@ -401,8 +412,9 @@ async def _what_was_built(client, bot: dict) -> dict:
                    "strategy_version": bot.get("strategy_version")}}
     try:
         strategy = await client.get(f"/strategy/bots/{_seg(bot_id)}/strategy")
-    except ApiError:
-        # The bot exists: never report a failed create or refine over a failed read.
+    except (ApiError, ApiUnreachable):
+        # The bot exists: never report a failed create or refine over a failed
+        # read (a timeout too), or the agent retries and makes a second bot.
         out["note"] = ("The bot was saved, but its rules couldn't be read back just now. "
                        "Call get_bot_strategy to check them before starting it.")
         return out
@@ -978,6 +990,7 @@ async def refine_bot(bot_id: str, prompt: str) -> str:
     client = get_client()
     bot = await client.post(f"/bots/{bot_id}/refine", {"prompt": prompt})
     out = await _what_was_built(client, {**bot, "id": bot.get("id") or bot_id})
+    out["success"] = True   # the key refine_bot answered with before 2026-11-13
     out["message"] = f"Strategy refined for '{bot.get('name')}'"
     return json.dumps(out, indent=2, default=str)
 

@@ -165,3 +165,33 @@ def test_list_bots_tolerates_a_missing_created_at(monkeypatch):
     bots = BOTS + [{**_bot(6, "Old", "paused", None)}]
     out = _run(monkeypatch, server.list_bots, _Api({"/bots/": bots}))
     assert out["bots"][-1]["id"] == "b6"     # undated bots sort last, never crash
+
+
+# --- review fixes -----------------------------------------------------------------
+
+def test_a_read_back_timeout_never_reports_a_failed_create(monkeypatch):
+    class _Slow(_Api):
+        async def get(self, endpoint):
+            raise server.ApiUnreachable("timed out")
+    out = _run(monkeypatch, server.create_bot, _Slow({"/bots/": BOT}), prompt="x")
+    assert out["bot"]["id"] == "q1" and "get_bot_strategy" in out["note"]
+
+
+def test_refine_bot_keeps_its_success_key(monkeypatch):
+    api = _Api({"/bots/q1/refine": BOT, "/strategy/bots/q1/strategy": STRATEGY})
+    out = _run(monkeypatch, server.refine_bot, api, bot_id="q1", prompt="x")
+    assert out["success"] is True
+
+
+def test_list_bots_orders_mixed_time_spellings_by_time(monkeypatch):
+    bots = [_bot(1, "a", "paused", "2026-11-13T00:23:22.500Z"),
+            _bot(2, "b", "paused", "2026-11-13T00:23:22Z"),
+            _bot(3, "c", "paused", "2026-11-13T01:00:00+00:00"),
+            _bot(4, "d", "paused", "not a time")]
+    out = _run(monkeypatch, server.list_bots, _Api({"/bots/": bots}))
+    assert [b["id"] for b in out["bots"]] == ["b3", "b1", "b2", "b4"]
+
+
+def test_an_empty_match_says_matched_zero(monkeypatch):
+    out = _run(monkeypatch, server.list_bots, _Api({"/bots/": BOTS}), status="error")
+    assert out["matched"] == 0

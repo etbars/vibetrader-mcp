@@ -1298,6 +1298,9 @@ async def run_backtest(
     minus holding), max drawdown, win rate and trade count. ignored_conditions
     lists rules the backtest can't model; the live bot still applies them, so
     results can differ. Report the buy-and-hold comparison with the return.
+    share_stop is there for a covered-call or wheel bot with a stop-loss,
+    take-profit or trailing stop on its shares: stopped_out says whether the
+    rule closed the position in this run; report its message with the return.
 
     Args:
         bot_id: The bot ID to backtest
@@ -1335,6 +1338,7 @@ async def run_backtest(
         "best_trade": round(result.get("best_trade", 0), 2),
         "worst_trade": round(result.get("worst_trade", 0), 2),
         **_vs_holding(result),
+        **_share_stop(result),
         "backtest_id": result.get("id")
     }
 
@@ -1353,6 +1357,15 @@ def _vs_holding(result: dict) -> dict:
         "vs_buy_and_hold_pct": round(strategy - hold, 2) if hold is not None and strategy is not None else None,
         "ignored_conditions": list(result.get("ignored_conditions") or []),
     }
+
+
+def _share_stop(result: dict) -> dict:
+    """What a covered-call or wheel bot's share stop did in the run, as the API
+    stores it: the rules, whether one was reached (stopped_out), the event and
+    the words for it. Passed through whole (a re-mapped field drifts silently,
+    2026-11-07); no field at all on a backtest without one."""
+    block = result.get("share_stop")
+    return {"share_stop": block} if isinstance(block, dict) and block else {}
 
 
 @_tool("List backtests", READ_ONLY)
@@ -1400,7 +1413,11 @@ async def get_backtest(bot_id: str, backtest_id: str) -> str:
         bot_id: The bot ID
         backtest_id: The backtest ID to retrieve
 
-    Returns full backtest details including trades and equity curve.
+    Returns the backtest's numbers, its trade and equity-curve counts, and the
+    buy-and-hold comparison. share_stop is there for a covered-call or wheel
+    bot with a stop-loss, take-profit or trailing stop on its shares:
+    stopped_out says whether the rule closed the position in this run; report
+    its message with the return.
     """
     client = get_client()
     result = await client.get(f"/backtest/bots/{bot_id}/backtests/{backtest_id}")
@@ -1427,6 +1444,7 @@ async def get_backtest(bot_id: str, backtest_id: str) -> str:
         "trade_count": len(result.get("trades", [])),
         "equity_curve_points": len(result.get("equity_curve", [])),
         **_vs_holding(result),
+        **_share_stop(result),
     }, indent=2)
 
 
